@@ -38,10 +38,17 @@ const snapshotKey = (roomId: string) => `tt:room:${roomId}:snapshot`;
 const PEER_PRESENCE_MS = 20000;
 
 function getRedis(): Redis | null {
+  // Accept the standard Upstash/Vercel KV names as well as the names produced
+  // when the Vercel integration is configured with an "UPSTASH_REDIS_REST"
+  // storage prefix (which yields UPSTASH_REDIS_REST_KV_REST_API_*).
   const url =
-    process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
+    process.env.UPSTASH_REDIS_REST_URL ??
+    process.env.KV_REST_API_URL ??
+    process.env.UPSTASH_REDIS_REST_KV_REST_API_URL;
   const token =
-    process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
+    process.env.UPSTASH_REDIS_REST_TOKEN ??
+    process.env.KV_REST_API_TOKEN ??
+    process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN;
   if (!url || !token) return null;
   return new Redis({ url, token });
 }
