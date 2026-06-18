@@ -52,6 +52,13 @@ export interface ModelSpec {
    */
   requiresShaderF16?: boolean;
   /**
+   * Per-model WebLLM ChatOptions overrides merged at load time. Used for models
+   * whose prebuilt MLC record needs adjustment — e.g. sliding-window models
+   * (Gemma 2/3) require exactly one of `context_window_size` /
+   * `sliding_window_size` to be positive, so we disable one here.
+   */
+  webllmOverrides?: Record<string, unknown>;
+  /**
    * Hugging Face repo id (e.g. "HuggingFaceTB/SmolLM2-360M-Instruct"). When set,
    * the model runs via the distributed WebGPU pipeline: its layers are
    * partitioned across the pool and each peer range-fetches only its slice of
@@ -111,6 +118,8 @@ export const MODELS: ModelSpec[] = [
     modelId: "gemma3-1b-it-q4f16_1-MLC",
     vramMb: 711,
     requiresShaderF16: true,
+    // Use the full context window; disable sliding window (MLC allows only one).
+    webllmOverrides: { sliding_window_size: -1 },
   },
   {
     id: "llama-3.2-1b",
@@ -156,6 +165,7 @@ export const MODELS: ModelSpec[] = [
     modelId: "gemma-2-2b-it-q4f16_1-MLC",
     vramMb: 1895,
     requiresShaderF16: true,
+    webllmOverrides: { sliding_window_size: -1 },
   },
   {
     id: "llama-3.2-3b-f32",

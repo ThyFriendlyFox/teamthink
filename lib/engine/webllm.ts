@@ -44,11 +44,20 @@ export class WebLLMEngine implements InferenceEngine {
     if (this.loadedModelId === model.modelId && this.engine) return;
     const webllm = await import("@mlc-ai/web-llm");
     await this.unload();
+    const createEngine = webllm.CreateMLCEngine as (
+      modelId: string,
+      engineConfig?: unknown,
+      chatOpts?: unknown,
+    ) => Promise<unknown>;
     try {
-      this.engine = await webllm.CreateMLCEngine(model.modelId, {
-        initProgressCallback: (r: { progress: number; text: string }) =>
-          onProgress({ progress: r.progress ?? 0, text: r.text ?? "" }),
-      });
+      this.engine = await createEngine(
+        model.modelId,
+        {
+          initProgressCallback: (r: { progress: number; text: string }) =>
+            onProgress({ progress: r.progress ?? 0, text: r.text ?? "" }),
+        },
+        model.webllmOverrides,
+      );
     } catch (err) {
       throw new Error(describeLoadError(model.label, err));
     }
