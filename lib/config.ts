@@ -51,6 +51,13 @@ export interface ModelSpec {
    * Nodes whose adapter lacks it are filtered out of this model's candidates.
    */
   requiresShaderF16?: boolean;
+  /**
+   * Hugging Face repo id (e.g. "HuggingFaceTB/SmolLM2-360M-Instruct"). When set,
+   * the model runs via the distributed WebGPU pipeline: its layers are
+   * partitioned across the pool and each peer range-fetches only its slice of
+   * the `safetensors` weights. No offline preparation is required.
+   */
+  hfRepo?: string;
 }
 
 /**
@@ -177,8 +184,70 @@ export const MODELS: ModelSpec[] = [
   },
 ];
 
+/**
+ * Distributed (pipeline-parallel) models. Their layers are partitioned across
+ * the pool at session time and each peer range-fetches only its slice of the
+ * weights straight from Hugging Face, so the pool's total hostable model size
+ * grows with the number of peers. Any ungated HF repo of a supported dense
+ * decoder family works; these are curated known-good defaults. The `vramMb`
+ * here is only a rough single-device hint and is not used for partitioning.
+ */
+export const SHARDED_MODELS: ModelSpec[] = [
+  {
+    id: "grid-smollm2-135m",
+    label: "SmolLM2 135M",
+    engine: "transformers",
+    modality: "text",
+    modelId: "HuggingFaceTB/SmolLM2-135M-Instruct",
+    vramMb: 0,
+    hfRepo: "HuggingFaceTB/SmolLM2-135M-Instruct",
+  },
+  {
+    id: "grid-smollm2-360m",
+    label: "SmolLM2 360M",
+    engine: "transformers",
+    modality: "text",
+    modelId: "HuggingFaceTB/SmolLM2-360M-Instruct",
+    vramMb: 0,
+    hfRepo: "HuggingFaceTB/SmolLM2-360M-Instruct",
+  },
+  {
+    id: "grid-tinyllama-1.1b",
+    label: "TinyLlama 1.1B Chat",
+    engine: "transformers",
+    modality: "text",
+    modelId: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    vramMb: 0,
+    hfRepo: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  },
+  {
+    id: "grid-qwen2.5-0.5b",
+    label: "Qwen2.5 0.5B Instruct",
+    engine: "transformers",
+    modality: "text",
+    modelId: "Qwen/Qwen2.5-0.5B-Instruct",
+    vramMb: 0,
+    hfRepo: "Qwen/Qwen2.5-0.5B-Instruct",
+  },
+  {
+    id: "grid-qwen2.5-1.5b",
+    label: "Qwen2.5 1.5B Instruct",
+    engine: "transformers",
+    modality: "text",
+    modelId: "Qwen/Qwen2.5-1.5B-Instruct",
+    vramMb: 0,
+    hfRepo: "Qwen/Qwen2.5-1.5B-Instruct",
+  },
+];
+
+export function getShardedModel(id: string): ModelSpec | undefined {
+  return SHARDED_MODELS.find((m) => m.id === id);
+}
+
 export function getModel(id: string): ModelSpec | undefined {
-  return MODELS.find((m) => m.id === id);
+  return (
+    MODELS.find((m) => m.id === id) ?? SHARDED_MODELS.find((m) => m.id === id)
+  );
 }
 
 export const DEFAULT_MODEL_ID = "smollm2-360m";

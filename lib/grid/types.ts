@@ -35,6 +35,66 @@ export interface PeerPresence {
   self?: boolean;
 }
 
+// --- pipeline-parallel (sharded) inference ----------------------------------
+
+export interface ShardAssignment {
+  peerId: string;
+  shardIndex: number;
+  /** Contiguous decoder layers this peer owns: [layerStart, layerEnd). */
+  layerStart: number;
+  layerEnd: number;
+  /** Owns the embedding + chain head. */
+  isFirst: boolean;
+  /** Owns the final norm + lm_head + sampling. */
+  isLast: boolean;
+}
+
+export interface PipelinePlan {
+  planId: string;
+  jobId: string;
+  modelId: string;
+  /** Hugging Face repo id; weights are range-fetched client-side per shard. */
+  repo: string;
+  requester: string;
+  numShards: number;
+  /** Ordered by shardIndex; shard 0 is the chain head. */
+  shards: ShardAssignment[];
+  options: { temperature: number; topP: number; maxTokens: number };
+}
+
+export type PipelineStatus =
+  | "planning"
+  | "warming"
+  | "running"
+  | "done"
+  | "error";
+
+/** A pipeline job, replicated across peers via the CRDT. */
+export interface PipelineRecord {
+  plan: PipelinePlan;
+  status: PipelineStatus;
+  /** peerId -> shard loaded and ready to run. */
+  ready: Record<string, boolean>;
+  result?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PipelineView {
+  planId: string;
+  modelId: string;
+  status: PipelineStatus;
+  numShards: number;
+  readyCount: number;
+  /** Per-shard layer ranges and the peer hosting each. */
+  shards: { peerId: string; layerStart: number; layerEnd: number }[];
+  /** Output text streamed so far (requester side). */
+  text: string;
+  tokensPerSec: number | null;
+  error?: string;
+}
+
 export interface GridSnapshot {
   selfId: string;
   caps: DeviceCapabilities | null;
@@ -45,4 +105,6 @@ export interface GridSnapshot {
   connected: boolean;
   activeModelId: string | null;
   modelLoad: { progress: number; text: string } | null;
+  /** Active pipeline jobs visible to this node. */
+  pipelines: PipelineView[];
 }

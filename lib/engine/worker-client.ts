@@ -1,9 +1,13 @@
 import type {
   ChatMessage,
   GenerateOptions,
+  ShardInput,
+  ShardResult,
   WorkerRequest,
   WorkerResponse,
 } from "@/lib/engine/types";
+import type { ArchDescriptor } from "@/lib/engine/hf/config";
+import type { ShardRange } from "@/lib/engine/shard/model-descriptor";
 
 /**
  * Main-thread wrapper around the inference worker. Manages a single worker and
@@ -24,7 +28,13 @@ interface PendingGenerate {
   reject: (e: Error) => void;
 }
 
-type Pending = PendingLoad | PendingGenerate;
+interface PendingShardRun {
+  type: "shardRun";
+  resolve: (r: ShardResult) => void;
+  reject: (e: Error) => void;
+}
+
+type Pending = PendingLoad | PendingGenerate | PendingShardRun;
 
 export class InferenceClient {
   private worker: Worker | null = null;
@@ -86,14 +96,53 @@ export class InferenceClient {
     });
   }
 
+  // --- pipeline shard ops ---------------------------------------------------
+
+  shardLoad(
+    descriptor: ArchDescriptor,
+    range: ShardRange,
+    onProgress?: (progress: number, text: string) => void,
+  ): Promise<void> {
+    const reqId = this.nextId();
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(reqId, { type: "load", onProgress, resolve, reject });
+      this.postRequest({ type: "shardLoad", reqId, descriptor, range });
+    });
+  }
+
+  shardRun(
+    input: ShardInput,
+    isLast: boolean,
+    options: { temperature: number; topP: number },
+  ): Promise<ShardResult> {
+    const reqId = this.nextId();
+    const transfer =
+      input.kind === "hidden" ? [input.data] : undefined;
+    return new Promise<ShardResult>((resolve, reject) => {
+      this.pending.set(reqId, { type: "shardRun", resolve, reject });
+      this.postRequest(
+        { type: "shardRun", reqId, input, isLast, options },
+        transfer,
+      );
+    });
+  }
+
+  shardReset(): Promise<void> {
+    const reqId = this.nextId();
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(reqId, { type: "load", resolve, reject });
+      this.postRequest({ type: "shardReset", reqId });
+    });
+  }
+
   terminate(): void {
     this.worker?.terminate();
     this.worker = null;
     this.pending.clear();
   }
 
-  private postRequest(req: WorkerRequest): void {
-    this.ensureWorker().postMessage(req);
+  private postRequest(req: WorkerRequest, transfer?: Transferable[]): void {
+    this.ensureWorker().postMessage(req, transfer ?? []);
   }
 
   private onMessage(msg: WorkerResponse): void {
@@ -115,6 +164,18 @@ export class InferenceClient {
       case "done":
         if (p.type === "generate") {
           p.resolve(msg.text);
+          this.pending.delete(msg.reqId);
+        }
+        break;
+      case "shardLoaded":
+        if (p.type === "load") {
+          p.resolve();
+          this.pending.delete(msg.reqId);
+        }
+        break;
+      case "shardResult":
+        if (p.type === "shardRun") {
+          p.resolve(msg.result);
           this.pending.delete(msg.reqId);
         }
         break;

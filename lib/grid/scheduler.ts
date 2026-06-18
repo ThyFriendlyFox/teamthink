@@ -13,8 +13,29 @@ import {
   modelFits,
   type DeviceCapabilities,
 } from "@/lib/grid/capabilities";
-import type { GridSnapshot, PeerPresence, TaskRecord } from "@/lib/grid/types";
-import { CHANNEL_APP, MeshClient } from "@/lib/mesh/peer";
+import type {
+  GridSnapshot,
+  PeerPresence,
+  PipelineRecord,
+  PipelineView,
+  TaskRecord,
+} from "@/lib/grid/types";
+import {
+  buildModelDescriptor,
+  buildPipelinePlan,
+  decodeIds,
+  encodePrompt,
+  loadTokenizer,
+  roleFor,
+} from "@/lib/grid/pipeline";
+import { CHANNEL_APP, CHANNEL_PIPE, MeshClient } from "@/lib/mesh/peer";
+import {
+  encodePipe,
+  PipeReassembler,
+  type PipeMessage,
+} from "@/lib/mesh/tensor-frame";
+import { isEos } from "@/lib/engine/shard/manifest";
+import type { ShardRange } from "@/lib/engine/shard/model-descriptor";
 import { MeshYjsProvider } from "@/lib/mesh/yjs-provider";
 import { generatePeerId } from "@/lib/id";
 
@@ -29,6 +50,28 @@ type AppMessage =
 const MAX_CONCURRENT = 1;
 /** Window to let CRDT claims converge before committing to run. */
 const CLAIM_SETTLE_MS = 350;
+/** If a pipeline step makes no progress within this window, abort. */
+const PIPE_STEP_TIMEOUT_MS = 30000;
+
+/** Local runtime state for a pipeline job this peer participates in. */
+interface PipeJobState {
+  planId: string;
+  jobId: string;
+  manifestSource: string;
+  options: { temperature: number; topP: number; maxTokens: number };
+  isFirst: boolean;
+  isLast: boolean;
+  nextPeerId: string | null;
+  firstPeerId: string | null;
+  requester: string;
+  isRequester: boolean;
+  /** Requester-side accumulated output token ids. */
+  outIds: number[];
+  /** Last-shard generated-token counter (for maxTokens stop). */
+  generated: number;
+  startedAt: number;
+  stopped: boolean;
+}
 
 /**
  * GridNode ties the mesh, CRDT, presence gossip, and inference worker together.
@@ -53,6 +96,17 @@ export class GridNode {
   private modelLoad: { progress: number; text: string } | null = null;
   private runningTasks = new Set<string>();
 
+  // --- pipeline-parallel state ----------------------------------------------
+  private pipelines: Y.Map<PipelineRecord>;
+  private reassemblers = new Map<string, PipeReassembler>();
+  private rtt = new Map<string, number>();
+  private pingSentAt = new Map<number, number>();
+  private pipeJobs = new Map<string, PipeJobState>();
+  private warmedPlan: string | null = null;
+  private pipeText = new Map<string, string>();
+  private pipeTps = new Map<string, number | null>();
+  private pipeStepTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   private listeners = new Set<() => void>();
   private snapshot: GridSnapshot;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -68,8 +122,10 @@ export class GridNode {
     });
     this.provider = new MeshYjsProvider(this.mesh, this.doc);
     this.tasks = this.doc.getMap<TaskRecord>("tasks");
+    this.pipelines = this.doc.getMap<PipelineRecord>("pipelines");
     this.snapshot = this.emptySnapshot();
     this.tasks.observeDeep(() => this.onTasksChanged());
+    this.pipelines.observeDeep(() => this.onPipelinesChanged());
   }
 
   async start(): Promise<void> {
@@ -83,6 +139,9 @@ export class GridNode {
 
     this.mesh.on(CHANNEL_APP, (peerId, payload) =>
       this.onAppMessage(peerId, payload),
+    );
+    this.mesh.on(CHANNEL_PIPE, (peerId, payload) =>
+      this.onPipeFrame(peerId, payload),
     );
 
     await this.mesh.start();
@@ -99,6 +158,8 @@ export class GridNode {
   stop(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    for (const t of this.pipeStepTimers.values()) clearTimeout(t);
+    this.pipeStepTimers.clear();
     this.provider.destroy();
     this.mesh.stop();
     this.inference.terminate();
@@ -115,8 +176,12 @@ export class GridNode {
     return this.snapshot;
   }
 
-  /** Submit an inference request to the grid. Returns the task id. */
+  /** Submit an inference request to the grid. Returns the task/job id. */
   submit(modelId: string, messages: ChatMessage[]): string {
+    const model = getModel(modelId);
+    if (model?.hfRepo) {
+      return this.submitPipeline(model.id, model.hfRepo, messages);
+    }
     const id = `t_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const now = Date.now();
     const task: TaskRecord = {
@@ -132,6 +197,15 @@ export class GridNode {
     this.streams.set(id, "");
     this.recompute();
     return id;
+  }
+
+  /**
+   * Submit a distributed inference request against an arbitrary Hugging Face
+   * repo (the model is partitioned across the pool client-side). Returns the
+   * job id.
+   */
+  submitRepo(repo: string, messages: ChatMessage[]): string {
+    return this.submitPipeline(repo, repo, messages);
   }
 
   /** Preload a model so this device advertises itself as a provider for it. */
@@ -180,6 +254,16 @@ export class GridNode {
     const self = this.presence.get(this.peerId);
     if (self) this.broadcastApp({ t: "presence", p: { ...self, self: false } });
     this.prunePresence();
+    this.pingPeers();
+  }
+
+  /** Measure RTT to connected peers for pipeline chain ordering. */
+  private pingPeers(): void {
+    for (const peerId of this.mesh.connectedPeers) {
+      const nonce = Math.floor(Math.random() * 0xffffffff);
+      this.pingSentAt.set(nonce, performance.now());
+      this.sendPipe(peerId, { kind: "ping", nonce });
+    }
   }
 
   private prunePresence(): void {
@@ -387,12 +471,513 @@ export class GridNode {
         });
       }
     }
+    this.pipelineWatchdog();
   }
 
   private patchTask(id: string, patch: Partial<TaskRecord>): void {
     const current = this.tasks.get(id);
     if (!current) return;
     this.tasks.set(id, { ...current, ...patch, updatedAt: Date.now() });
+  }
+
+  // --- pipeline-parallel (sharded) inference --------------------------------
+
+  /** Build a plan, publish it, and (once shards warm up) drive generation. */
+  private submitPipeline(
+    modelId: string,
+    repo: string,
+    messages: ChatMessage[],
+  ): string {
+    const jobId = `j_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const planId = jobId;
+    void this.planAndPublish(modelId, repo, messages, jobId, planId);
+    return jobId;
+  }
+
+  private async planAndPublish(
+    modelId: string,
+    repo: string,
+    messages: ChatMessage[],
+    jobId: string,
+    planId: string,
+  ): Promise<void> {
+    try {
+      const desc = await buildModelDescriptor(repo);
+      const options = { temperature: 0.7, topP: 0.95, maxTokens: 256 };
+      const result = buildPipelinePlan({
+        modelId,
+        repo,
+        desc,
+        requester: this.peerId,
+        peers: [...this.presence.values()],
+        rtt: this.rtt,
+        options,
+        jobId,
+        planId,
+      });
+      if (!result.ok) {
+        this.publishPipelineError(planId, modelId, repo, result.error);
+        return;
+      }
+      // Stash the prompt so we can tokenize once shards are ready.
+      this.pendingPrompts.set(jobId, { source: repo, messages });
+      const record: PipelineRecord = {
+        plan: result.plan,
+        status: "warming",
+        ready: {},
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      this.pipelines.set(planId, record);
+      this.recompute();
+    } catch (err) {
+      this.publishPipelineError(
+        planId,
+        modelId,
+        repo,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  private pendingPrompts = new Map<
+    string,
+    { source: string; messages: ChatMessage[] }
+  >();
+
+  private publishPipelineError(
+    planId: string,
+    modelId: string,
+    repo: string,
+    error: string,
+  ): void {
+    const existing = this.pipelines.get(planId);
+    const plan = existing?.plan ?? {
+      planId,
+      jobId: planId,
+      modelId,
+      repo,
+      requester: this.peerId,
+      numShards: 0,
+      shards: [],
+      options: { temperature: 0.7, topP: 0.95, maxTokens: 256 },
+    };
+    this.pipelines.set(planId, {
+      plan,
+      status: "error",
+      ready: existing?.ready ?? {},
+      error,
+      createdAt: existing?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+    });
+    this.recompute();
+  }
+
+  /** Observe plan changes: warm our assigned shard, and (requester) start. */
+  private onPipelinesChanged(): void {
+    this.recompute();
+    for (const [planId, record] of this.pipelines.entries()) {
+      if (record.status === "error" || record.status === "done") continue;
+      const role = roleFor(record.plan, this.peerId);
+
+      // Warm our shard if assigned and not already warming/warmed.
+      if (
+        role.shardIndex != null &&
+        this.warmedPlan !== planId &&
+        !record.ready[this.peerId]
+      ) {
+        void this.warmShard(planId, record);
+      }
+
+      // Requester: once every shard is ready, kick off generation.
+      if (
+        role.isRequester &&
+        record.status === "warming" &&
+        this.allShardsReady(record)
+      ) {
+        void this.startPipeline(planId, record);
+      }
+    }
+  }
+
+  private allShardsReady(record: PipelineRecord): boolean {
+    return record.plan.shards.every((s) => record.ready[s.peerId]);
+  }
+
+  private async warmShard(
+    planId: string,
+    record: PipelineRecord,
+  ): Promise<void> {
+    if (this.warmedPlan && this.warmedPlan !== planId) return; // one plan at a time
+    this.warmedPlan = planId;
+    const role = roleFor(record.plan, this.peerId);
+    if (role.shardIndex == null) return;
+    const assignment = record.plan.shards.find((s) => s.peerId === this.peerId);
+    if (!assignment) return;
+    const range: ShardRange = {
+      index: assignment.shardIndex,
+      layerStart: assignment.layerStart,
+      layerEnd: assignment.layerEnd,
+      isFirst: assignment.isFirst,
+      isLast: assignment.isLast,
+    };
+    try {
+      const desc = await buildModelDescriptor(record.plan.repo);
+      await this.inference.shardLoad(desc, range, (progress, text) => {
+        this.modelLoad = { progress, text };
+        this.recompute();
+      });
+      this.modelLoad = null;
+      const cur = this.pipelines.get(planId);
+      if (!cur) return;
+      this.pipelines.set(planId, {
+        ...cur,
+        ready: { ...cur.ready, [this.peerId]: true },
+        updatedAt: Date.now(),
+      });
+      this.recompute();
+    } catch (err) {
+      this.warmedPlan = null;
+      this.publishPipelineError(
+        planId,
+        record.plan.modelId,
+        record.plan.repo,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  private async startPipeline(
+    planId: string,
+    record: PipelineRecord,
+  ): Promise<void> {
+    const pending = this.pendingPrompts.get(record.plan.jobId);
+    if (!pending) return;
+    this.pendingPrompts.delete(record.plan.jobId);
+
+    const cur = this.pipelines.get(planId);
+    if (cur) {
+      this.pipelines.set(planId, {
+        ...cur,
+        status: "running",
+        updatedAt: Date.now(),
+      });
+    }
+
+    const tok = await loadTokenizer(pending.source);
+    const ids = await encodePrompt(tok, pending.messages);
+    const head = record.plan.shards.find((s) => s.shardIndex === 0)!.peerId;
+    this.sendPipe(head, {
+      kind: "start",
+      jobId: record.plan.jobId,
+      planId,
+      tokenIds: ids,
+      options: record.plan.options,
+    });
+  }
+
+  // --- pipe transport / message handling ------------------------------------
+
+  private onPipeFrame(peerId: string, payload: Uint8Array): void {
+    let re = this.reassemblers.get(peerId);
+    if (!re) {
+      re = new PipeReassembler();
+      this.reassemblers.set(peerId, re);
+    }
+    const msg = re.push(payload);
+    if (msg) void this.onPipeMessage(peerId, msg);
+  }
+
+  private sendPipe(peerId: string, msg: PipeMessage): void {
+    if (peerId === this.peerId) {
+      // Loopback for a peer that hosts a shard for its own request.
+      void this.onPipeMessage(this.peerId, msg);
+      return;
+    }
+    for (const frame of encodePipe(msg)) {
+      this.mesh.sendTo(peerId, CHANNEL_PIPE, frame);
+    }
+  }
+
+  private ensurePipeJob(planId: string, jobId: string): PipeJobState | null {
+    const existing = this.pipeJobs.get(jobId);
+    if (existing) return existing;
+    const record = this.pipelines.get(planId);
+    if (!record) return null;
+    const role = roleFor(record.plan, this.peerId);
+    const state: PipeJobState = {
+      planId,
+      jobId,
+      manifestSource: "",
+      options: record.plan.options,
+      isFirst: role.isFirst,
+      isLast: role.isLast,
+      nextPeerId: role.nextPeerId,
+      firstPeerId: role.firstPeerId,
+      requester: record.plan.requester,
+      isRequester: role.isRequester,
+      outIds: [],
+      generated: 0,
+      startedAt: performance.now(),
+      stopped: false,
+    };
+    this.pipeJobs.set(jobId, state);
+    return state;
+  }
+
+  private async onPipeMessage(from: string, msg: PipeMessage): Promise<void> {
+    switch (msg.kind) {
+      case "ping":
+        this.sendPipe(from, { kind: "pong", nonce: msg.nonce });
+        return;
+      case "pong": {
+        const sent = this.pingSentAt.get(msg.nonce);
+        if (sent != null) {
+          this.rtt.set(from, performance.now() - sent);
+          this.pingSentAt.delete(msg.nonce);
+        }
+        return;
+      }
+      case "abort": {
+        const job = this.pipeJobs.get(msg.jobId);
+        if (job) job.stopped = true;
+        this.clearStepTimer(msg.jobId);
+        return;
+      }
+      case "start": {
+        const job = this.ensurePipeJob(msg.planId, msg.jobId);
+        if (!job) return;
+        await this.runShardStep(job, { kind: "ids", ids: msg.tokenIds }, 0);
+        return;
+      }
+      case "activation": {
+        const job = this.pipeJobs.get(msg.jobId);
+        if (!job || job.stopped) return;
+        await this.runShardStep(
+          job,
+          { kind: "hidden", dims: msg.dims, data: msg.data },
+          msg.step,
+        );
+        return;
+      }
+      case "token": {
+        if (msg.to === "head") {
+          // I am shard 0: embed this token and run the next step.
+          const job = this.pipeJobs.get(msg.jobId);
+          if (!job || job.stopped) return;
+          await this.runShardStep(
+            job,
+            { kind: "ids", ids: [msg.tokenId] },
+            msg.step,
+          );
+        } else {
+          // I am the requester: stream the sampled token.
+          await this.onTokenSink(msg.jobId, msg.tokenId, msg.done);
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  private async runShardStep(
+    job: PipeJobState,
+    input: { kind: "ids"; ids: number[] } | { kind: "hidden"; dims: number[]; data: ArrayBuffer },
+    step: number,
+  ): Promise<void> {
+    if (job.stopped) return;
+    this.armStepTimer(job.jobId);
+    try {
+      const result = await this.inference.shardRun(input, job.isLast, {
+        temperature: job.options.temperature,
+        topP: job.options.topP,
+      });
+      if (result.kind === "hidden") {
+        if (job.nextPeerId) {
+          this.sendPipe(job.nextPeerId, {
+            kind: "activation",
+            jobId: job.jobId,
+            step,
+            dtype: "f32",
+            dims: result.dims,
+            data: result.data,
+          });
+        }
+      } else {
+        // Last shard: a token was sampled.
+        job.generated += 1;
+        const desc = await buildModelDescriptor(
+          this.pipelines.get(job.planId)!.plan.repo,
+        );
+        const done =
+          job.generated >= job.options.maxTokens ||
+          isEos(result.tokenId, desc.eosTokenId);
+        // Stream to requester.
+        this.sendPipe(job.requester, {
+          kind: "token",
+          jobId: job.jobId,
+          step,
+          tokenId: result.tokenId,
+          done,
+          to: "sink",
+        });
+        // Feed back to the head for the next step, unless finished.
+        if (!done && job.firstPeerId) {
+          this.sendPipe(job.firstPeerId, {
+            kind: "token",
+            jobId: job.jobId,
+            step: step + 1,
+            tokenId: result.tokenId,
+            done: false,
+            to: "head",
+          });
+        } else {
+          this.clearStepTimer(job.jobId);
+        }
+      }
+    } catch (err) {
+      this.abortPipeline(
+        job.planId,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  private async onTokenSink(
+    jobId: string,
+    tokenId: number,
+    done: boolean,
+  ): Promise<void> {
+    const record = [...this.pipelines.values()].find(
+      (r) => r.plan.jobId === jobId,
+    );
+    if (!record) return;
+    const job =
+      this.pipeJobs.get(jobId) ?? this.ensurePipeJob(record.plan.planId, jobId);
+    if (!job) return;
+
+    job.outIds.push(tokenId);
+    job.generated += 1;
+    const elapsed = (performance.now() - job.startedAt) / 1000;
+    this.pipeTps.set(jobId, elapsed > 0 ? job.outIds.length / elapsed : null);
+
+    try {
+      const tok = await loadTokenizer(record.plan.repo);
+      this.pipeText.set(jobId, decodeIds(tok, job.outIds));
+    } catch {
+      // best-effort detokenization
+    }
+
+    if (done) {
+      job.stopped = true;
+      this.clearStepTimer(jobId);
+      const cur = this.pipelines.get(record.plan.planId);
+      if (cur) {
+        this.pipelines.set(record.plan.planId, {
+          ...cur,
+          status: "done",
+          result: this.pipeText.get(jobId) ?? "",
+          updatedAt: Date.now(),
+        });
+      }
+      if (this.warmedPlan === record.plan.planId) this.warmedPlan = null;
+    }
+    this.recompute();
+  }
+
+  // --- pipeline fault handling ----------------------------------------------
+
+  private armStepTimer(jobId: string): void {
+    this.clearStepTimer(jobId);
+    this.pipeStepTimers.set(
+      jobId,
+      setTimeout(() => {
+        const job = this.pipeJobs.get(jobId);
+        if (job && !job.stopped) {
+          this.abortPipeline(job.planId, "pipeline step timed out");
+        }
+      }, PIPE_STEP_TIMEOUT_MS),
+    );
+  }
+
+  private clearStepTimer(jobId: string): void {
+    const t = this.pipeStepTimers.get(jobId);
+    if (t) {
+      clearTimeout(t);
+      this.pipeStepTimers.delete(jobId);
+    }
+  }
+
+  private abortPipeline(planId: string, reason: string): void {
+    const record = this.pipelines.get(planId);
+    if (!record) return;
+    const job = this.pipeJobs.get(record.plan.jobId);
+    if (job) job.stopped = true;
+    this.clearStepTimer(record.plan.jobId);
+    // Tell the other shard peers to stop.
+    for (const s of record.plan.shards) {
+      if (s.peerId !== this.peerId) {
+        this.sendPipe(s.peerId, {
+          kind: "abort",
+          jobId: record.plan.jobId,
+          reason,
+        });
+      }
+    }
+    if (record.status !== "done") {
+      this.pipelines.set(planId, {
+        ...record,
+        status: "error",
+        error: reason,
+        updatedAt: Date.now(),
+      });
+    }
+    if (this.warmedPlan === planId) this.warmedPlan = null;
+    this.recompute();
+  }
+
+  /** Detect shards on peers that have gone stale and abort their jobs. */
+  private pipelineWatchdog(): void {
+    const now = Date.now();
+    for (const [planId, record] of this.pipelines.entries()) {
+      if (record.status !== "running" && record.status !== "warming") continue;
+      for (const s of record.plan.shards) {
+        if (s.peerId === this.peerId) continue;
+        const p = this.presence.get(s.peerId);
+        const alive = p && now - p.ts < PEER_STALE_MS;
+        if (!alive) {
+          this.abortPipeline(planId, `shard peer ${s.peerId} dropped`);
+          break;
+        }
+      }
+    }
+  }
+
+  private pipelineViews(): PipelineView[] {
+    const views: PipelineView[] = [];
+    for (const record of this.pipelines.values()) {
+      const jobId = record.plan.jobId;
+      const readyCount = record.plan.shards.filter(
+        (s) => record.ready[s.peerId],
+      ).length;
+      views.push({
+        planId: record.plan.planId,
+        modelId: record.plan.modelId,
+        status: record.status,
+        numShards: record.plan.numShards,
+        readyCount,
+        shards: record.plan.shards.map((s) => ({
+          peerId: s.peerId,
+          layerStart: s.layerStart,
+          layerEnd: s.layerEnd,
+        })),
+        text: this.pipeText.get(jobId) ?? record.result ?? "",
+        tokensPerSec: this.pipeTps.get(jobId) ?? null,
+        error: record.error,
+      });
+    }
+    return views.sort((a, b) => a.planId.localeCompare(b.planId));
   }
 
   // --- snapshot persistence (cold start for late joiners) -------------------
@@ -461,6 +1046,7 @@ export class GridNode {
       connected: this.mesh.connectedPeers.length > 0,
       activeModelId: this.activeModelId,
       modelLoad: this.modelLoad,
+      pipelines: this.pipelineViews(),
     };
     for (const l of this.listeners) l();
   }
@@ -475,6 +1061,7 @@ export class GridNode {
       connected: false,
       activeModelId: null,
       modelLoad: null,
+      pipelines: [],
     };
   }
 }

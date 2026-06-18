@@ -16,6 +16,9 @@ export function NodePanel({
   snapshot: GridSnapshot;
 }) {
   const { caps, activeModelId, modelLoad } = snapshot;
+  const activePipelines = snapshot.pipelines.filter(
+    (p) => p.status === "warming" || p.status === "running",
+  );
   const [hosting, setHosting] = useState(false);
   const compatible = caps
     ? MODELS.filter((m) => caps.compatibleModelIds.includes(m.id))
@@ -54,6 +57,12 @@ export function NodePanel({
             </Badge>
             {caps.gpuVendor && <Badge>{caps.gpuVendor}</Badge>}
             <Badge>~{(caps.memoryEstimateMb / 1024).toFixed(1)} GB usable</Badge>
+            {caps.shaderF16 && <Badge>f16</Badge>}
+            {activePipelines.map((p) => (
+              <Badge key={p.planId} tone="accent" dot>
+                pipeline {p.readyCount}/{p.numShards}
+              </Badge>
+            ))}
           </div>
 
           <div>

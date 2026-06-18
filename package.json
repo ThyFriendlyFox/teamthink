@@ -13,6 +13,7 @@
     "@mlc-ai/web-llm": "^0.2.84",
     "@upstash/redis": "^1.38.0",
     "next": "16.2.9",
+    "onnxruntime-web": "^1.26.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "yjs": "^13.6.31"

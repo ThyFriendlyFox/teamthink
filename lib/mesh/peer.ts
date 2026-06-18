@@ -13,6 +13,8 @@ import type { SignalMessage } from "@/lib/server/signaling-store";
 
 export const CHANNEL_CRDT = 0;
 export const CHANNEL_APP = 1;
+/** Pipeline-parallel inference traffic (chunked tensors, tokens, control). */
+export const CHANNEL_PIPE = 2;
 
 type FrameHandler = (peerId: string, payload: Uint8Array) => void;
 
