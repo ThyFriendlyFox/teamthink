@@ -65,6 +65,8 @@ export interface PipelinePlan {
 export type PipelineStatus =
   | "planning"
   | "warming"
+  | "ready"
+  | "queued"
   | "running"
   | "done"
   | "error";
@@ -95,6 +97,23 @@ export interface PipelineView {
   error?: string;
 }
 
+/**
+ * The model currently selected and warmed on the distribution network. Loading
+ * begins on selection (not on first prompt), so this surfaces warm progress and
+ * the layer partition across peers.
+ */
+export interface ProvisionedView {
+  modelId: string;
+  repo: string;
+  status: PipelineStatus;
+  numShards: number;
+  readyCount: number;
+  shards: { peerId: string; layerStart: number; layerEnd: number }[];
+  error?: string;
+  /** Per-shard download/warm progress on this device. */
+  progress: { progress: number; text: string } | null;
+}
+
 export interface GridSnapshot {
   selfId: string;
   caps: DeviceCapabilities | null;
@@ -105,6 +124,8 @@ export interface GridSnapshot {
   connected: boolean;
   activeModelId: string | null;
   modelLoad: { progress: number; text: string } | null;
-  /** Active pipeline jobs visible to this node. */
+  /** The model warmed on the grid (selected in the console), if any. */
+  provisioned: ProvisionedView | null;
+  /** One entry per submitted prompt (chat history) run on the provisioned model. */
   pipelines: PipelineView[];
 }

@@ -29,7 +29,7 @@ export function SessionView({ roomId }: { roomId: string }) {
               hint={openTasks ? `${openTasks} queued` : undefined}
             />
           </div>
-          <NodePanel node={node} snapshot={snapshot} />
+          <NodePanel snapshot={snapshot} />
           <PeerList peers={snapshot.peers} />
         </div>
 

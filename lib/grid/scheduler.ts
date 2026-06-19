@@ -18,6 +18,7 @@ import type {
   PeerPresence,
   PipelineRecord,
   PipelineView,
+  ProvisionedView,
   TaskRecord,
 } from "@/lib/grid/types";
 import {
@@ -57,7 +58,6 @@ const PIPE_STEP_TIMEOUT_MS = 30000;
 interface PipeJobState {
   planId: string;
   jobId: string;
-  manifestSource: string;
   options: { temperature: number; topP: number; maxTokens: number };
   isFirst: boolean;
   isLast: boolean;
@@ -65,12 +65,24 @@ interface PipeJobState {
   firstPeerId: string | null;
   requester: string;
   isRequester: boolean;
-  /** Requester-side accumulated output token ids. */
-  outIds: number[];
   /** Last-shard generated-token counter (for maxTokens stop). */
   generated: number;
-  startedAt: number;
   stopped: boolean;
+}
+
+/** Requester-side per-prompt display + accumulation state (the chat bubbles). */
+interface JobView {
+  jobId: string;
+  planId: string;
+  modelId: string;
+  prompt: string;
+  status: "queued" | "running" | "done" | "error";
+  text: string;
+  outIds: number[];
+  tokensPerSec: number | null;
+  error?: string;
+  startedAt: number | null;
+  createdAt: number;
 }
 
 /**
@@ -103,9 +115,15 @@ export class GridNode {
   private pingSentAt = new Map<number, number>();
   private pipeJobs = new Map<string, PipeJobState>();
   private warmedPlan: string | null = null;
-  private pipeText = new Map<string, string>();
-  private pipeTps = new Map<string, number | null>();
   private pipeStepTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // provisioned (selected) model + per-prompt jobs (requester side)
+  private provisionedPlanId: string | null = null;
+  private provisionedRepo: string | null = null;
+  private jobs = new Map<string, JobView>();
+  private jobMessages = new Map<string, ChatMessage[]>();
+  private jobQueue: string[] = [];
+  private currentJobId: string | null = null;
 
   private listeners = new Set<() => void>();
   private snapshot: GridSnapshot;
@@ -180,7 +198,8 @@ export class GridNode {
   submit(modelId: string, messages: ChatMessage[]): string {
     const model = getModel(modelId);
     if (model?.hfRepo) {
-      return this.submitPipeline(model.id, model.hfRepo, messages);
+      void this.provision(model.id, model.hfRepo);
+      return this.runPrompt(messages) ?? "";
     }
     const id = `t_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const now = Date.now();
@@ -200,12 +219,66 @@ export class GridNode {
   }
 
   /**
-   * Submit a distributed inference request against an arbitrary Hugging Face
-   * repo (the model is partitioned across the pool client-side). Returns the
-   * job id.
+   * Select a distributed model and warm it on the grid. Loading begins now (the
+   * model's layers are partitioned across the pool and each peer range-fetches
+   * its slice), so prompts run against an already-warm model. `modelId` is the
+   * registry id (or the repo itself for custom repos).
    */
-  submitRepo(repo: string, messages: ChatMessage[]): string {
-    return this.submitPipeline(repo, repo, messages);
+  async provision(modelId: string, repo: string): Promise<void> {
+    if (this.provisionedRepo === repo && this.provisionedPlanId) return;
+    const prev = this.provisionedPlanId;
+    this.provisionedRepo = repo;
+    const planId = `pl_${slug(modelId)}_${slug(repo)}`;
+    this.provisionedPlanId = planId;
+    // Cancel anything queued against the previous model.
+    for (const jobId of this.jobQueue) {
+      const v = this.jobs.get(jobId);
+      if (v) {
+        v.status = "error";
+        v.error = "model changed";
+      }
+    }
+    this.jobQueue = [];
+    this.jobMessages.clear();
+    this.recompute();
+    if (prev && prev !== planId) {
+      this.pipelines.delete(prev);
+      if (this.warmedPlan === prev) this.warmedPlan = null;
+    }
+    await this.planAndPublish(modelId, repo, planId);
+  }
+
+  /** Convenience for an arbitrary HF repo (custom repo input). */
+  provisionRepo(repo: string): Promise<void> {
+    return this.provision(repo, repo);
+  }
+
+  /**
+   * Run a prompt against the currently provisioned (warmed) model. Queues if the
+   * model is still warming or another prompt is in flight. Returns the job id.
+   */
+  runPrompt(messages: ChatMessage[]): string | null {
+    const planId = this.provisionedPlanId;
+    if (!planId) return null;
+    const jobId = `j_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const modelId = this.pipelines.get(planId)?.plan.modelId ?? planId;
+    this.jobs.set(jobId, {
+      jobId,
+      planId,
+      modelId,
+      prompt: messages.at(-1)?.content ?? "",
+      status: "queued",
+      text: "",
+      outIds: [],
+      tokensPerSec: null,
+      startedAt: null,
+      createdAt: Date.now(),
+    });
+    this.jobMessages.set(jobId, messages);
+    this.jobQueue.push(jobId);
+    this.recompute();
+    void this.maybeRunNext();
+    return jobId;
   }
 
   /** Preload a model so this device advertises itself as a provider for it. */
@@ -482,23 +555,10 @@ export class GridNode {
 
   // --- pipeline-parallel (sharded) inference --------------------------------
 
-  /** Build a plan, publish it, and (once shards warm up) drive generation. */
-  private submitPipeline(
-    modelId: string,
-    repo: string,
-    messages: ChatMessage[],
-  ): string {
-    const jobId = `j_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const planId = jobId;
-    void this.planAndPublish(modelId, repo, messages, jobId, planId);
-    return jobId;
-  }
-
+  /** Build and publish a warm plan for the selected model (no prompt yet). */
   private async planAndPublish(
     modelId: string,
     repo: string,
-    messages: ChatMessage[],
-    jobId: string,
     planId: string,
   ): Promise<void> {
     try {
@@ -512,15 +572,13 @@ export class GridNode {
         peers: [...this.presence.values()],
         rtt: this.rtt,
         options,
-        jobId,
+        jobId: planId,
         planId,
       });
       if (!result.ok) {
         this.publishPipelineError(planId, modelId, repo, result.error);
         return;
       }
-      // Stash the prompt so we can tokenize once shards are ready.
-      this.pendingPrompts.set(jobId, { source: repo, messages });
       const record: PipelineRecord = {
         plan: result.plan,
         status: "warming",
@@ -539,11 +597,6 @@ export class GridNode {
       );
     }
   }
-
-  private pendingPrompts = new Map<
-    string,
-    { source: string; messages: ChatMessage[] }
-  >();
 
   private publishPipelineError(
     planId: string,
@@ -573,11 +626,11 @@ export class GridNode {
     this.recompute();
   }
 
-  /** Observe plan changes: warm our assigned shard, and (requester) start. */
+  /** Observe plan changes: warm our assigned shard; mark ready when warm. */
   private onPipelinesChanged(): void {
     this.recompute();
     for (const [planId, record] of this.pipelines.entries()) {
-      if (record.status === "error" || record.status === "done") continue;
+      if (record.status === "error") continue;
       const role = roleFor(record.plan, this.peerId);
 
       // Warm our shard if assigned and not already warming/warmed.
@@ -589,13 +642,21 @@ export class GridNode {
         void this.warmShard(planId, record);
       }
 
-      // Requester: once every shard is ready, kick off generation.
+      // Requester: once every shard is warm, mark ready and run queued prompts.
       if (
         role.isRequester &&
         record.status === "warming" &&
         this.allShardsReady(record)
       ) {
-        void this.startPipeline(planId, record);
+        const cur = this.pipelines.get(planId);
+        if (cur) {
+          this.pipelines.set(planId, {
+            ...cur,
+            status: "ready",
+            updatedAt: Date.now(),
+          });
+        }
+        void this.maybeRunNext();
       }
     }
   }
@@ -647,33 +708,60 @@ export class GridNode {
     }
   }
 
-  private async startPipeline(
+  /** Dequeue and run the next prompt when the model is warm and idle. */
+  private async maybeRunNext(): Promise<void> {
+    if (this.currentJobId) return;
+    const planId = this.provisionedPlanId;
+    if (!planId) return;
+    const record = this.pipelines.get(planId);
+    if (!record || record.status !== "ready") return;
+    const jobId = this.jobQueue.shift();
+    if (!jobId) return;
+    const messages = this.jobMessages.get(jobId);
+    this.jobMessages.delete(jobId);
+    if (!messages) return;
+    this.currentJobId = jobId;
+    await this.startJob(planId, jobId, messages);
+  }
+
+  private async startJob(
     planId: string,
-    record: PipelineRecord,
+    jobId: string,
+    messages: ChatMessage[],
   ): Promise<void> {
-    const pending = this.pendingPrompts.get(record.plan.jobId);
-    if (!pending) return;
-    this.pendingPrompts.delete(record.plan.jobId);
-
-    const cur = this.pipelines.get(planId);
-    if (cur) {
-      this.pipelines.set(planId, {
-        ...cur,
-        status: "running",
-        updatedAt: Date.now(),
-      });
+    const record = this.pipelines.get(planId);
+    const view = this.jobs.get(jobId);
+    if (!record) {
+      if (view) {
+        view.status = "error";
+        view.error = "model not provisioned";
+      }
+      this.currentJobId = null;
+      this.recompute();
+      return;
     }
-
-    const tok = await loadTokenizer(pending.source);
-    const ids = await encodePrompt(tok, pending.messages);
-    const head = record.plan.shards.find((s) => s.shardIndex === 0)!.peerId;
-    this.sendPipe(head, {
-      kind: "start",
-      jobId: record.plan.jobId,
-      planId,
-      tokenIds: ids,
-      options: record.plan.options,
-    });
+    if (view) view.status = "running";
+    this.recompute();
+    try {
+      const tok = await loadTokenizer(record.plan.repo);
+      const ids = await encodePrompt(tok, messages);
+      const head = record.plan.shards.find((s) => s.shardIndex === 0)!.peerId;
+      this.sendPipe(head, {
+        kind: "start",
+        jobId,
+        planId,
+        tokenIds: ids,
+        options: record.plan.options,
+      });
+    } catch (err) {
+      if (view) {
+        view.status = "error";
+        view.error = err instanceof Error ? err.message : String(err);
+      }
+      this.currentJobId = null;
+      this.recompute();
+      void this.maybeRunNext();
+    }
   }
 
   // --- pipe transport / message handling ------------------------------------
@@ -708,7 +796,6 @@ export class GridNode {
     const state: PipeJobState = {
       planId,
       jobId,
-      manifestSource: "",
       options: record.plan.options,
       isFirst: role.isFirst,
       isLast: role.isLast,
@@ -716,9 +803,7 @@ export class GridNode {
       firstPeerId: role.firstPeerId,
       requester: record.plan.requester,
       isRequester: role.isRequester,
-      outIds: [],
       generated: 0,
-      startedAt: performance.now(),
       stopped: false,
     };
     this.pipeJobs.set(jobId, state);
@@ -751,7 +836,13 @@ export class GridNode {
         return;
       }
       case "activation": {
-        const job = this.pipeJobs.get(msg.jobId);
+        // A mid/tail shard may not have a job yet; derive its plan from the
+        // single plan it warmed.
+        const job =
+          this.pipeJobs.get(msg.jobId) ??
+          (this.warmedPlan
+            ? this.ensurePipeJob(this.warmedPlan, msg.jobId)
+            : null);
         if (!job || job.stopped) return;
         await this.runShardStep(
           job,
@@ -787,6 +878,16 @@ export class GridNode {
     step: number,
   ): Promise<void> {
     if (job.stopped) return;
+    // Each prompt reuses the warm shard runner, so clear the KV cache at the
+    // start of every job (step 0) before processing the prefill.
+    if (step === 0) {
+      try {
+        await this.inference.shardReset();
+      } catch {
+        // best-effort; a fresh runner starts empty anyway
+      }
+      job.generated = 0;
+    }
     this.armStepTimer(job.jobId);
     try {
       const result = await this.inference.shardRun(input, job.isLast, {
@@ -840,6 +941,7 @@ export class GridNode {
       this.abortPipeline(
         job.planId,
         err instanceof Error ? err.message : String(err),
+        job.jobId,
       );
     }
   }
@@ -849,39 +951,30 @@ export class GridNode {
     tokenId: number,
     done: boolean,
   ): Promise<void> {
-    const record = [...this.pipelines.values()].find(
-      (r) => r.plan.jobId === jobId,
-    );
-    if (!record) return;
-    const job =
-      this.pipeJobs.get(jobId) ?? this.ensurePipeJob(record.plan.planId, jobId);
-    if (!job) return;
+    const view = this.jobs.get(jobId);
+    if (!view) return;
+    if (view.startedAt == null) view.startedAt = performance.now();
 
-    job.outIds.push(tokenId);
-    job.generated += 1;
-    const elapsed = (performance.now() - job.startedAt) / 1000;
-    this.pipeTps.set(jobId, elapsed > 0 ? job.outIds.length / elapsed : null);
+    view.outIds.push(tokenId);
+    const elapsed = (performance.now() - view.startedAt) / 1000;
+    view.tokensPerSec = elapsed > 0 ? view.outIds.length / elapsed : null;
 
-    try {
-      const tok = await loadTokenizer(record.plan.repo);
-      this.pipeText.set(jobId, decodeIds(tok, job.outIds));
-    } catch {
-      // best-effort detokenization
+    const record = this.pipelines.get(view.planId);
+    if (record) {
+      try {
+        const tok = await loadTokenizer(record.plan.repo);
+        view.text = decodeIds(tok, view.outIds);
+      } catch {
+        // best-effort detokenization
+      }
     }
 
     if (done) {
-      job.stopped = true;
+      view.status = "done";
       this.clearStepTimer(jobId);
-      const cur = this.pipelines.get(record.plan.planId);
-      if (cur) {
-        this.pipelines.set(record.plan.planId, {
-          ...cur,
-          status: "done",
-          result: this.pipeText.get(jobId) ?? "",
-          updatedAt: Date.now(),
-        });
-      }
-      if (this.warmedPlan === record.plan.planId) this.warmedPlan = null;
+      this.pipeJobs.delete(jobId);
+      if (this.currentJobId === jobId) this.currentJobId = null;
+      void this.maybeRunNext();
     }
     this.recompute();
   }
@@ -895,7 +988,7 @@ export class GridNode {
       setTimeout(() => {
         const job = this.pipeJobs.get(jobId);
         if (job && !job.stopped) {
-          this.abortPipeline(job.planId, "pipeline step timed out");
+          this.abortPipeline(job.planId, "pipeline step timed out", jobId);
         }
       }, PIPE_STEP_TIMEOUT_MS),
     );
@@ -909,39 +1002,51 @@ export class GridNode {
     }
   }
 
-  private abortPipeline(planId: string, reason: string): void {
+  private abortPipeline(planId: string, reason: string, jobId?: string): void {
     const record = this.pipelines.get(planId);
-    if (!record) return;
-    const job = this.pipeJobs.get(record.plan.jobId);
-    if (job) job.stopped = true;
-    this.clearStepTimer(record.plan.jobId);
-    // Tell the other shard peers to stop.
-    for (const s of record.plan.shards) {
-      if (s.peerId !== this.peerId) {
-        this.sendPipe(s.peerId, {
-          kind: "abort",
-          jobId: record.plan.jobId,
-          reason,
+    const failedJob = jobId ?? this.currentJobId;
+    if (failedJob) {
+      const job = this.pipeJobs.get(failedJob);
+      if (job) job.stopped = true;
+      this.pipeJobs.delete(failedJob);
+      this.clearStepTimer(failedJob);
+      const view = this.jobs.get(failedJob);
+      if (view && view.status !== "done") {
+        view.status = "error";
+        view.error = reason;
+      }
+      if (this.currentJobId === failedJob) this.currentJobId = null;
+    }
+    if (record) {
+      // Tell the other shard peers to stop this job.
+      for (const s of record.plan.shards) {
+        if (s.peerId !== this.peerId) {
+          this.sendPipe(s.peerId, {
+            kind: "abort",
+            jobId: failedJob ?? record.plan.jobId,
+            reason,
+          });
+        }
+      }
+      if (record.status !== "error") {
+        this.pipelines.set(planId, {
+          ...record,
+          status: "error",
+          error: reason,
+          updatedAt: Date.now(),
         });
       }
+      if (this.warmedPlan === planId) this.warmedPlan = null;
     }
-    if (record.status !== "done") {
-      this.pipelines.set(planId, {
-        ...record,
-        status: "error",
-        error: reason,
-        updatedAt: Date.now(),
-      });
-    }
-    if (this.warmedPlan === planId) this.warmedPlan = null;
     this.recompute();
+    void this.maybeRunNext();
   }
 
   /** Detect shards on peers that have gone stale and abort their jobs. */
   private pipelineWatchdog(): void {
     const now = Date.now();
     for (const [planId, record] of this.pipelines.entries()) {
-      if (record.status !== "running" && record.status !== "warming") continue;
+      if (record.status === "error") continue;
       for (const s of record.plan.shards) {
         if (s.peerId === this.peerId) continue;
         const p = this.presence.get(s.peerId);
@@ -954,30 +1059,68 @@ export class GridNode {
     }
   }
 
-  private pipelineViews(): PipelineView[] {
-    const views: PipelineView[] = [];
-    for (const record of this.pipelines.values()) {
-      const jobId = record.plan.jobId;
-      const readyCount = record.plan.shards.filter(
-        (s) => record.ready[s.peerId],
-      ).length;
-      views.push({
-        planId: record.plan.planId,
-        modelId: record.plan.modelId,
-        status: record.status,
-        numShards: record.plan.numShards,
-        readyCount,
-        shards: record.plan.shards.map((s) => ({
-          peerId: s.peerId,
-          layerStart: s.layerStart,
-          layerEnd: s.layerEnd,
-        })),
-        text: this.pipeText.get(jobId) ?? record.result ?? "",
-        tokensPerSec: this.pipeTps.get(jobId) ?? null,
-        error: record.error,
-      });
+  /** The model warmed on the grid (selected in the console), if any. */
+  private provisionedView(): ProvisionedView | null {
+    const planId = this.provisionedPlanId;
+    if (!planId) return null;
+    const record = this.pipelines.get(planId);
+    if (!record) {
+      return {
+        modelId: this.provisionedRepo ?? planId,
+        repo: this.provisionedRepo ?? "",
+        status: "planning",
+        numShards: 0,
+        readyCount: 0,
+        shards: [],
+        progress: this.modelLoad,
+      };
     }
-    return views.sort((a, b) => a.planId.localeCompare(b.planId));
+    const readyCount = record.plan.shards.filter(
+      (s) => record.ready[s.peerId],
+    ).length;
+    return {
+      modelId: record.plan.modelId,
+      repo: record.plan.repo,
+      status: record.status,
+      numShards: record.plan.numShards,
+      readyCount,
+      shards: record.plan.shards.map((s) => ({
+        peerId: s.peerId,
+        layerStart: s.layerStart,
+        layerEnd: s.layerEnd,
+      })),
+      error: record.error,
+      progress: this.modelLoad,
+    };
+  }
+
+  /** One view per submitted prompt (chat history). */
+  private pipelineViews(): PipelineView[] {
+    const planId = this.provisionedPlanId;
+    const record = planId ? this.pipelines.get(planId) : null;
+    const numShards = record?.plan.numShards ?? 0;
+    const readyCount = record
+      ? record.plan.shards.filter((s) => record.ready[s.peerId]).length
+      : 0;
+    const shards =
+      record?.plan.shards.map((s) => ({
+        peerId: s.peerId,
+        layerStart: s.layerStart,
+        layerEnd: s.layerEnd,
+      })) ?? [];
+    return [...this.jobs.values()]
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((j) => ({
+        planId: j.jobId,
+        modelId: j.modelId,
+        status: j.status as PipelineView["status"],
+        numShards,
+        readyCount,
+        shards,
+        text: j.text,
+        tokensPerSec: j.tokensPerSec,
+        error: j.error,
+      }));
   }
 
   // --- snapshot persistence (cold start for late joiners) -------------------
@@ -1046,6 +1189,7 @@ export class GridNode {
       connected: this.mesh.connectedPeers.length > 0,
       activeModelId: this.activeModelId,
       modelLoad: this.modelLoad,
+      provisioned: this.provisionedView(),
       pipelines: this.pipelineViews(),
     };
     for (const l of this.listeners) l();
@@ -1061,9 +1205,15 @@ export class GridNode {
       connected: false,
       activeModelId: null,
       modelLoad: null,
+      provisioned: null,
       pipelines: [],
     };
   }
+}
+
+/** Filesystem-safe short id from an arbitrary string (for stable plan ids). */
+function slug(s: string): string {
+  return s.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
 }
 
 function encodeApp(msg: AppMessage): Uint8Array {

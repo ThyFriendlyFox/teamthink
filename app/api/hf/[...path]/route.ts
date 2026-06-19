@@ -16,6 +16,17 @@ export const dynamic = "force-dynamic";
 
 const HF_BASE = "https://huggingface.co";
 
+/** Server-side HF access token (set in the deploy env, never exposed). */
+function hfToken(): string | undefined {
+  return (
+    process.env.HF_TOKEN ||
+    process.env.HUGGING_FACE_HUB_TOKEN ||
+    process.env.HUGGINGFACE_TOKEN ||
+    process.env.HF_API_KEY ||
+    undefined
+  );
+}
+
 function corsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -37,10 +48,17 @@ async function proxy(req: NextRequest, path: string[]): Promise<Response> {
   // Only allow the resolve/ paths that serve model files; reject anything else.
   const target = `${HF_BASE}/${path.map(encodeURIComponent).join("/")}`;
 
+  const fwd: Record<string, string> = {};
   const range = req.headers.get("range");
+  if (range) fwd.Range = range;
+  // A host-provided token lifts the strict anonymous rate limits and unlocks
+  // gated repos. It never reaches the browser — only this server attaches it.
+  const token = hfToken();
+  if (token) fwd.Authorization = `Bearer ${token}`;
+
   const upstream = await fetch(target, {
     method: req.method === "HEAD" ? "HEAD" : "GET",
-    headers: range ? { Range: range } : {},
+    headers: fwd,
     redirect: "follow",
   });
 
