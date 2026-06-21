@@ -1,4 +1,9 @@
-import { ICE_SERVERS, SIGNAL_POLL_INTERVAL_MS } from "@/lib/config";
+import {
+  ICE_SERVERS,
+  SIGNAL_POLL_BACKOFF,
+  SIGNAL_POLL_MAX_MS,
+  SIGNAL_POLL_MIN_MS,
+} from "@/lib/config";
 import type { SignalMessage } from "@/lib/server/signaling-store";
 
 /**
@@ -36,6 +41,9 @@ export class MeshClient {
   private connections = new Map<string, Connection>();
   private handlers = new Map<number, Set<FrameHandler>>();
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private pollDelay = SIGNAL_POLL_MIN_MS;
+  private polling = false;
+  private peerSig = "";
   private stopped = false;
 
   constructor(
@@ -46,11 +54,17 @@ export class MeshClient {
 
   async start(): Promise<void> {
     await this.signal({ action: "join", roomId: this.roomId, peerId: this.peerId });
-    this.loop();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibility);
+    }
+    void this.tick();
   }
 
   stop(): void {
     this.stopped = true;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibility);
+    }
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const [, conn] of this.connections) {
       conn.channel?.close();
@@ -98,21 +112,59 @@ export class MeshClient {
 
   // --- signaling loop -------------------------------------------------------
 
-  private loop(): void {
+  /** Schedule the next poll, replacing any pending timer. */
+  private scheduleNext(delay: number): void {
     if (this.stopped) return;
-    void this.poll().finally(() => {
-      if (this.stopped) return;
-      this.pollTimer = setTimeout(() => this.loop(), SIGNAL_POLL_INTERVAL_MS);
-    });
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = setTimeout(() => void this.tick(), delay);
   }
 
-  private async poll(): Promise<void> {
+  private async tick(): Promise<void> {
+    if (this.stopped || this.polling) return;
+    this.polling = true;
+    let active = false;
+    try {
+      active = await this.poll();
+    } finally {
+      this.polling = false;
+    }
+    if (this.stopped) return;
+    this.pollDelay = this.nextPollDelay(active);
+    this.scheduleNext(this.pollDelay);
+  }
+
+  /**
+   * Fast cadence while connecting or when state is changing; otherwise back off
+   * geometrically toward the max so a stable, fully-connected mesh barely
+   * touches the server. Hidden tabs go straight to the max.
+   */
+  private nextPollDelay(active: boolean): number {
+    const hidden = typeof document !== "undefined" && document.hidden;
+    if (active && !hidden) return SIGNAL_POLL_MIN_MS;
+    const backed = Math.min(
+      SIGNAL_POLL_MAX_MS,
+      Math.round(this.pollDelay * SIGNAL_POLL_BACKOFF),
+    );
+    return hidden ? SIGNAL_POLL_MAX_MS : backed;
+  }
+
+  /** A tab returning to the foreground should reconnect/discover promptly. */
+  private onVisibility = (): void => {
+    if (typeof document === "undefined" || document.hidden || this.stopped) {
+      return;
+    }
+    this.pollDelay = SIGNAL_POLL_MIN_MS;
+    if (!this.polling) this.scheduleNext(0);
+  };
+
+  /** Returns whether this poll observed activity (keeps the cadence fast). */
+  private async poll(): Promise<boolean> {
     const res = await this.signal({
       action: "poll",
       roomId: this.roomId,
       peerId: this.peerId,
     });
-    if (!res) return;
+    if (!res) return false;
     const { messages = [], peers = [] } = res as {
       messages?: SignalMessage[];
       peers?: string[];
@@ -133,6 +185,14 @@ export class MeshClient {
 
     for (const msg of messages) await this.handleSignal(msg);
     this.events.onPeersChange?.(this.connectedPeers);
+
+    // Stay fast while handshakes are in flight or the peer set is shifting;
+    // a stable, fully-connected mesh produces none of these and backs off.
+    const peerSig = [...peers].sort().join(",");
+    const peersChanged = peerSig !== this.peerSig;
+    this.peerSig = peerSig;
+    const establishing = [...this.connections.values()].some((c) => !c.open);
+    return messages.length > 0 || peersChanged || establishing;
   }
 
   /** Deterministic tie-break so exactly one side creates the offer. */

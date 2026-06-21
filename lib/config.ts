@@ -28,8 +28,17 @@ export const HEARTBEAT_INTERVAL_MS = 4000;
 export const PEER_STALE_MS = 15000;
 export const TASK_STALE_MS = 30000;
 
-/** Signaling poll cadence (used when Upstash SSE is unavailable). */
-export const SIGNAL_POLL_INTERVAL_MS = 1500;
+/**
+ * Signaling poll cadence. The loop polls fast while connections are being
+ * established (or peers/messages are changing) and backs off toward the max
+ * once the mesh is stable — at steady state all traffic is peer-to-peer, so the
+ * server is only needed to notice newcomers. Kept under the presence window
+ * (see PEER_PRESENCE_MS in the signaling store) so peers don't expire.
+ */
+export const SIGNAL_POLL_MIN_MS = 1500;
+export const SIGNAL_POLL_MAX_MS = 10000;
+/** Multiplicative backoff applied each idle poll. */
+export const SIGNAL_POLL_BACKOFF = 1.6;
 
 export type EngineKind = "webllm" | "transformers";
 
