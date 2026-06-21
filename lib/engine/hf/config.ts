@@ -6,11 +6,29 @@
  * writing new kernels.
  */
 
+/** Same-origin proxy route (opt-in fallback; see `hfFileUrl`). */
 export const HF_PROXY_PREFIX = "/api/hf";
+/** Hugging Face CDN host for direct, browser->HF weight reads. */
+export const HF_DIRECT_BASE = "https://huggingface.co";
 
-/** Build a proxied resolve URL for a repo file. */
+/**
+ * Build a resolve URL for a repo file.
+ *
+ * By default this points straight at the Hugging Face CDN, so the (multi-hundred
+ * -MB) weight range-reads happen browser->HF and never touch our origin. HF
+ * serves permissive CORS and `Accept-Ranges: bytes` on `resolve/`, so partial
+ * reads work directly from the browser. Routing these through the serverless
+ * `/api/hf` proxy previously charged every weight byte against the deployment's
+ * origin/data-transfer budget.
+ *
+ * Set `NEXT_PUBLIC_HF_PROXY=1` to opt back into the same-origin proxy — only
+ * needed for gated repos that require a server-side token, or networks that
+ * block the HF CDN. Inference always runs in the browser regardless.
+ */
 export function hfFileUrl(repo: string, file: string, rev = "main"): string {
-  return `${HF_PROXY_PREFIX}/${repo}/resolve/${rev}/${file}`;
+  const base =
+    process.env.NEXT_PUBLIC_HF_PROXY === "1" ? HF_PROXY_PREFIX : HF_DIRECT_BASE;
+  return `${base}/${repo}/resolve/${rev}/${file}`;
 }
 
 export type ModelFamily =

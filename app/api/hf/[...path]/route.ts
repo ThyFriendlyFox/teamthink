@@ -4,14 +4,16 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * Range/CORS proxy for Hugging Face model files. Browsers range-fetch only the
- * byte slices of `safetensors` they need (per-shard weights), but the public HF
- * CDN does not reliably expose CORS for cross-origin range requests. This route
- * forwards GET requests to huggingface.co, passing the `Range` header through
- * and returning `206`/`Content-Range` so the client can do partial reads.
+ * Opt-in range/CORS proxy for Hugging Face model files. By default the client
+ * range-fetches `safetensors` slices directly from the HF CDN (which serves
+ * permissive CORS + `Accept-Ranges`), so weight bytes never touch this origin.
+ * This route is only used when `NEXT_PUBLIC_HF_PROXY=1` — for gated repos that
+ * need a server-side token, or networks that block the HF CDN. It forwards GET
+ * requests to huggingface.co, passing the `Range` header through and returning
+ * `206`/`Content-Range` so the client can do partial reads.
  *
- * Inference still runs entirely in the browser; only the weight bytes pass
- * through this origin.
+ * Note: routing weights through here bills every byte against the deployment's
+ * origin/data-transfer budget, so leave the proxy off unless you need it.
  */
 
 const HF_BASE = "https://huggingface.co";
