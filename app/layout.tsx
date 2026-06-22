@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import { Analytics } from "@vercel/analytics/next";
 import { bodySans, displaySerif, mono } from "./fonts";
 import "./globals.css";
 
@@ -19,10 +18,7 @@ export default function RootLayout({
       lang="en"
       className={`${bodySans.variable} ${displaySerif.variable} ${mono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">
-        {children}
-        <Analytics />
-      </body>
+      <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );
 }

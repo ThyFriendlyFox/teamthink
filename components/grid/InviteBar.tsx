@@ -13,7 +13,7 @@ export function InviteBar({
   connected: boolean;
 }) {
   const [copied, setCopied] = useState(false);
-  const path = `/s/${roomId}`;
+  const path = `/s?r=${roomId}`;
 
   async function copy() {
     const url =

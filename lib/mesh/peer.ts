@@ -1,19 +1,22 @@
-import {
-  ICE_SERVERS,
-  SIGNAL_POLL_BACKOFF,
-  SIGNAL_POLL_MAX_MS,
-  SIGNAL_POLL_MIN_MS,
-} from "@/lib/config";
-import type { SignalMessage } from "@/lib/server/signaling-store";
+import { ICE_SERVERS, SIGNALING_SERVERS } from "@/lib/config";
+import { SignalingClient } from "@/lib/mesh/signaling";
 
 /**
- * Client-side WebRTC full-mesh manager. Uses the KV-backed signaling mailbox
- * (/api/signal) only to bootstrap connections; once a data channel opens, all
- * traffic flows peer-to-peer.
+ * Client-side WebRTC full-mesh manager. Peers find each other through a public
+ * pub/sub signaling relay (see `signaling.ts`) keyed by the room id, exchange
+ * the SDP/ICE handshake there, and then talk directly over WebRTC data
+ * channels. Nothing — not signaling, not data — touches our own origin; the
+ * deployment only serves the static page.
+ *
+ * Discovery is push-based, not polled: a peer announces itself once on join
+ * (with a small retry burst to ride out relay races) and again on reconnect;
+ * existing peers reply so the newcomer learns them, then a deterministic
+ * tie-break decides who sends the offer. A stable mesh produces no signaling
+ * traffic at all.
  *
  * Framing: every data-channel frame is a Uint8Array whose first byte is a
- * channel tag, letting multiple logical streams (CRDT sync, app messages)
- * share one channel.
+ * channel tag, letting multiple logical streams (CRDT sync, app messages,
+ * pipeline tensors) share one channel.
  */
 
 export const CHANNEL_CRDT = 0;
@@ -22,6 +25,7 @@ export const CHANNEL_APP = 1;
 export const CHANNEL_PIPE = 2;
 
 type FrameHandler = (peerId: string, payload: Uint8Array) => void;
+type WebrtcKind = "offer" | "answer" | "candidate";
 
 interface MeshEvents {
   onPeerOpen?: (peerId: string) => void;
@@ -37,46 +41,47 @@ interface Connection {
   open: boolean;
 }
 
+/** Re-announce schedule (ms after join/reconnect) to survive relay races. */
+const ANNOUNCE_BURST_MS = [0, 1500, 4000];
+
 export class MeshClient {
   private connections = new Map<string, Connection>();
   private handlers = new Map<number, Set<FrameHandler>>();
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
-  private pollDelay = SIGNAL_POLL_MIN_MS;
-  private polling = false;
-  private peerSig = "";
+  private signaling: SignalingClient;
+  private announceTimers: ReturnType<typeof setTimeout>[] = [];
   private stopped = false;
 
   constructor(
     readonly roomId: string,
     readonly peerId: string,
     private events: MeshEvents = {},
-  ) {}
+  ) {
+    this.signaling = new SignalingClient(
+      `teamthink/${roomId}`,
+      SIGNALING_SERVERS,
+      {
+        onMessage: (msg) => this.onSignal(msg),
+        onOpen: () => this.announceBurst(),
+      },
+    );
+  }
 
   async start(): Promise<void> {
-    await this.signal({ action: "join", roomId: this.roomId, peerId: this.peerId });
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", this.onVisibility);
-    }
-    void this.tick();
+    this.signaling.start();
   }
 
   stop(): void {
     this.stopped = true;
-    if (typeof document !== "undefined") {
-      document.removeEventListener("visibilitychange", this.onVisibility);
-    }
-    if (this.pollTimer) clearTimeout(this.pollTimer);
+    for (const t of this.announceTimers) clearTimeout(t);
+    this.announceTimers = [];
+    // Best-effort departure notice so peers tear down promptly.
+    this.signaling.publish({ kind: "bye", from: this.peerId });
+    this.signaling.stop();
     for (const [, conn] of this.connections) {
       conn.channel?.close();
       conn.pc.close();
     }
     this.connections.clear();
-    // Best-effort presence removal.
-    void this.signal({
-      action: "leave",
-      roomId: this.roomId,
-      peerId: this.peerId,
-    }).catch(() => {});
   }
 
   /** Subscribe to frames on a logical channel. Returns an unsubscribe fn. */
@@ -110,94 +115,62 @@ export class MeshClient {
       .map(([id]) => id);
   }
 
-  // --- signaling loop -------------------------------------------------------
+  // --- discovery / signaling ------------------------------------------------
 
-  /** Schedule the next poll, replacing any pending timer. */
-  private scheduleNext(delay: number): void {
-    if (this.stopped) return;
-    if (this.pollTimer) clearTimeout(this.pollTimer);
-    this.pollTimer = setTimeout(() => void this.tick(), delay);
-  }
-
-  private async tick(): Promise<void> {
-    if (this.stopped || this.polling) return;
-    this.polling = true;
-    let active = false;
-    try {
-      active = await this.poll();
-    } finally {
-      this.polling = false;
-    }
-    if (this.stopped) return;
-    this.pollDelay = this.nextPollDelay(active);
-    this.scheduleNext(this.pollDelay);
-  }
-
-  /**
-   * Fast cadence while connecting or when state is changing; otherwise back off
-   * geometrically toward the max so a stable, fully-connected mesh barely
-   * touches the server. Hidden tabs go straight to the max.
-   */
-  private nextPollDelay(active: boolean): number {
-    const hidden = typeof document !== "undefined" && document.hidden;
-    if (active && !hidden) return SIGNAL_POLL_MIN_MS;
-    const backed = Math.min(
-      SIGNAL_POLL_MAX_MS,
-      Math.round(this.pollDelay * SIGNAL_POLL_BACKOFF),
+  /** Announce presence a few times to ride out relay/connect races. */
+  private announceBurst(): void {
+    for (const t of this.announceTimers) clearTimeout(t);
+    this.announceTimers = ANNOUNCE_BURST_MS.map((d) =>
+      setTimeout(() => {
+        if (this.stopped) return;
+        this.signaling.publish({ kind: "announce", from: this.peerId });
+      }, d),
     );
-    return hidden ? SIGNAL_POLL_MAX_MS : backed;
   }
 
-  /** A tab returning to the foreground should reconnect/discover promptly. */
-  private onVisibility = (): void => {
-    if (typeof document === "undefined" || document.hidden || this.stopped) {
-      return;
+  private onSignal(msg: Record<string, unknown>): void {
+    const from = msg.from as string | undefined;
+    if (!from || from === this.peerId) return; // ignore our own fan-out
+    const kind = msg.kind as string | undefined;
+
+    if (kind === "announce") {
+      const to = msg.to as string | undefined;
+      if (to && to !== this.peerId) return; // a directed reply for someone else
+      this.onAnnounce(from, Boolean(to));
+    } else if (kind === "bye") {
+      this.teardown(from, true);
+    } else if (kind === "webrtc" && msg.to === this.peerId) {
+      const sig = msg.signal as { kind: WebrtcKind; data: unknown } | undefined;
+      if (sig) void this.handleSignal(from, sig.kind, sig.data);
     }
-    this.pollDelay = SIGNAL_POLL_MIN_MS;
-    if (!this.polling) this.scheduleNext(0);
-  };
+  }
 
-  /** Returns whether this poll observed activity (keeps the cadence fast). */
-  private async poll(): Promise<boolean> {
-    const res = await this.signal({
-      action: "poll",
-      roomId: this.roomId,
-      peerId: this.peerId,
-    });
-    if (!res) return false;
-    const { messages = [], peers = [] } = res as {
-      messages?: SignalMessage[];
-      peers?: string[];
-    };
-
-    for (const peerId of peers) {
-      if (!this.connections.has(peerId) && this.shouldInitiate(peerId)) {
-        await this.initiate(peerId);
-      }
+  private onAnnounce(from: string, directed: boolean): void {
+    if (this.connections.has(from)) return;
+    // Reply to a broadcast announce so the newcomer learns about us; a directed
+    // reply needs no further reply (avoids a loop).
+    if (!directed) {
+      this.signaling.publish({
+        kind: "announce",
+        from: this.peerId,
+        to: from,
+      });
     }
-    // Drop connections to peers that left.
-    for (const [peerId, conn] of this.connections) {
-      if (!peers.includes(peerId) && !conn.open) {
-        // keep open connections even if presence momentarily lapses
-        this.teardown(peerId);
-      }
-    }
-
-    for (const msg of messages) await this.handleSignal(msg);
-    this.events.onPeersChange?.(this.connectedPeers);
-
-    // Stay fast while handshakes are in flight or the peer set is shifting;
-    // a stable, fully-connected mesh produces none of these and backs off.
-    const peerSig = [...peers].sort().join(",");
-    const peersChanged = peerSig !== this.peerSig;
-    this.peerSig = peerSig;
-    const establishing = [...this.connections.values()].some((c) => !c.open);
-    return messages.length > 0 || peersChanged || establishing;
+    if (this.shouldInitiate(from)) void this.initiate(from);
   }
 
   /** Deterministic tie-break so exactly one side creates the offer. */
   private shouldInitiate(peerId: string): boolean {
     return this.peerId < peerId;
+  }
+
+  private send(to: string, kind: WebrtcKind, data: unknown): void {
+    this.signaling.publish({
+      kind: "webrtc",
+      from: this.peerId,
+      to,
+      signal: { kind, data },
+    });
   }
 
   // --- connection setup -----------------------------------------------------
@@ -213,9 +186,7 @@ export class MeshClient {
     this.connections.set(peerId, conn);
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        void this.send(peerId, "candidate", e.candidate.toJSON());
-      }
+      if (e.candidate) this.send(peerId, "candidate", e.candidate.toJSON());
     };
     pc.onconnectionstatechange = () => {
       if (
@@ -261,37 +232,38 @@ export class MeshClient {
   }
 
   private async initiate(peerId: string): Promise<void> {
+    if (this.connections.has(peerId)) return;
     const conn = this.createConnection(peerId);
     const channel = conn.pc.createDataChannel("tt", { ordered: true });
     this.bindChannel(peerId, conn, channel);
     const offer = await conn.pc.createOffer();
     await conn.pc.setLocalDescription(offer);
-    await this.send(peerId, "offer", offer);
+    this.send(peerId, "offer", offer);
   }
 
-  private async handleSignal(msg: SignalMessage): Promise<void> {
-    let conn = this.connections.get(msg.from);
+  private async handleSignal(
+    from: string,
+    kind: WebrtcKind,
+    data: unknown,
+  ): Promise<void> {
+    let conn = this.connections.get(from);
 
-    if (msg.kind === "offer") {
-      if (!conn) conn = this.createConnection(msg.from);
-      await conn.pc.setRemoteDescription(
-        msg.data as RTCSessionDescriptionInit,
-      );
+    if (kind === "offer") {
+      if (!conn) conn = this.createConnection(from);
+      await conn.pc.setRemoteDescription(data as RTCSessionDescriptionInit);
       conn.remoteSet = true;
       await this.flushCandidates(conn);
       const answer = await conn.pc.createAnswer();
       await conn.pc.setLocalDescription(answer);
-      await this.send(msg.from, "answer", answer);
-    } else if (msg.kind === "answer") {
+      this.send(from, "answer", answer);
+    } else if (kind === "answer") {
       if (!conn) return;
-      await conn.pc.setRemoteDescription(
-        msg.data as RTCSessionDescriptionInit,
-      );
+      await conn.pc.setRemoteDescription(data as RTCSessionDescriptionInit);
       conn.remoteSet = true;
       await this.flushCandidates(conn);
-    } else if (msg.kind === "candidate") {
+    } else if (kind === "candidate") {
       if (!conn) return;
-      const cand = msg.data as RTCIceCandidateInit;
+      const cand = data as RTCIceCandidateInit;
       if (conn.remoteSet) {
         await conn.pc.addIceCandidate(cand).catch(() => {});
       } else {
@@ -307,39 +279,16 @@ export class MeshClient {
     conn.pendingCandidates = [];
   }
 
-  private teardown(peerId: string): void {
+  private teardown(peerId: string, emitClose = false): void {
     const conn = this.connections.get(peerId);
     if (!conn) return;
+    const wasOpen = conn.open;
     conn.channel?.close();
     conn.pc.close();
     this.connections.delete(peerId);
-  }
-
-  // --- transport helpers ----------------------------------------------------
-
-  private async send(
-    to: string,
-    kind: SignalMessage["kind"],
-    data: unknown,
-  ): Promise<void> {
-    await this.signal({
-      action: "send",
-      roomId: this.roomId,
-      message: { from: this.peerId, to, kind, data, ts: Date.now() },
-    });
-  }
-
-  private async signal(body: unknown): Promise<unknown> {
-    try {
-      const res = await fetch("/api/signal", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
+    if (emitClose && wasOpen) {
+      this.events.onPeerClose?.(peerId);
+      this.events.onPeersChange?.(this.connectedPeers);
     }
   }
 }

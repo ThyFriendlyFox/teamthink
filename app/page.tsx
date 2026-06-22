@@ -4,26 +4,23 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
+import { generateRoomId } from "@/lib/id";
 
 export default function Home() {
   const router = useRouter();
   const [creating, setCreating] = useState(false);
   const [joinValue, setJoinValue] = useState("");
 
-  async function createSession() {
+  function createSession() {
     setCreating(true);
-    try {
-      const res = await fetch("/api/room", { method: "POST" });
-      const { roomId } = (await res.json()) as { roomId: string };
-      router.push(`/s/${roomId}`);
-    } finally {
-      setCreating(false);
-    }
+    // Room ids are minted client-side; the id in the link is all a peer needs
+    // to join the pool over public signaling. No server round-trip.
+    router.push(`/s?r=${generateRoomId()}`);
   }
 
   function joinSession() {
     const code = extractRoomId(joinValue.trim());
-    if (code) router.push(`/s/${code}`);
+    if (code) router.push(`/s?r=${code}`);
   }
 
   return (
@@ -116,6 +113,9 @@ function extractRoomId(value: string): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
+    // Current form: /s?r=<id>. Legacy form: /s/<id>.
+    const q = url.searchParams.get("r");
+    if (q && /^[a-z0-9]+$/i.test(q)) return q;
     const match = url.pathname.match(/\/s\/([a-z0-9]+)/i);
     if (match) return match[1];
   } catch {

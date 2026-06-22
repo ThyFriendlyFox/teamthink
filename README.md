@@ -1,28 +1,36 @@
-# TeamThink — Server-Minimized WebGPU Inference Grid
+# TeamThink — Serverless WebGPU Inference Grid
 
 Spin up a session, share an invite link, and run model inference across a
 peer-to-peer mesh of browsers. Each device that joins becomes a WebGPU compute
 node; inference requests are routed to whichever peer has capacity.
 
+The app ships as a **fully static site** — the deployment only serves the page.
+There is no backend, no database, and no API routes: signaling runs over public
+WebRTC relays and model weights are fetched directly from the Hugging Face CDN.
+Nothing of ours sits in the data path.
+
 ## Architecture
 
-- **Control-plane bootstrap (only server piece):** Vercel KV / Upstash Redis as
-  a TTL'd signaling mailbox + room registry, reached through serverless API
-  routes (`/api/room`, `/api/signal`) via short-polling. Carries WebRTC SDP/ICE
-  only.
+- **Signaling (no backend):** peers find each other through a public pub/sub
+  WebRTC signaling relay (the [y-webrtc](https://github.com/yjs/y-webrtc)
+  protocol) keyed by the room id, and exchange only the SDP/ICE handshake there.
+  A stable mesh produces no signaling traffic. Override the relays with
+  `NEXT_PUBLIC_SIGNALING_URLS` (e.g. to self-host one).
 - **Data plane (peer-to-peer):** a [Yjs](https://github.com/yjs/yjs) document is
   replicated across peers over WebRTC data channels. Presence/capability
   heartbeats are gossiped; a shared task map drives scheduling. Tokens stream
-  directly from the runner to the requester.
+  directly from the runner to the requester. Late joiners sync the document from
+  any connected peer (no server-persisted snapshot).
+- **Weights:** range-fetched straight from the Hugging Face CDN by each browser.
 - **Inference:** runs in a Web Worker behind a pluggable engine interface —
   [WebLLM](https://github.com/mlc-ai/web-llm) (chat LLMs) and
   [Transformers.js](https://github.com/huggingface/transformers.js) (vision and
-  more). Phase B (VRAM-pooling / model sharding) implements the same interface.
+  more). VRAM-pooling / model sharding implements the same interface.
 
 ```
-Browser A ─┐                         ┌─ Browser B
-           ├── /api/signal (KV) ─────┤    (WebGPU compute)
-Browser C ─┘   SDP/ICE handshake     └─ Browser D
+Browser A ─┐     public WebRTC      ┌─ Browser B
+           ├──  signaling relay  ───┤    (WebGPU compute)
+Browser C ─┘    SDP/ICE handshake   └─ Browser D
      │                                       │
      └────── WebRTC data channels: Yjs CRDT + token streams ──────┘
 ```
@@ -41,23 +49,36 @@ pnpm dev
 ```
 
 Open the app, click **Create session**, then open the invite link in a second
-browser/tab/device to join the mesh. Without KV credentials, a single-process
-in-memory signaling store is used (sufficient for same-machine testing).
+browser/tab/device to join the mesh.
 
 ## Configure
 
-Copy `.env.example` to `.env.local` and fill in the Upstash/Vercel KV
-credentials (see comments). Optional TURN relay variables are also documented
-there.
+No configuration is required to run. Optional environment variables:
 
-## Deploy to Vercel
+- `NEXT_PUBLIC_SIGNALING_URLS` — comma-separated WebRTC signaling relay URLs to
+  use instead of the public defaults. The defaults are shared community
+  y-webrtc relays; for a reliable deployment run your own (it's a tiny
+  WebSocket process) and point this at it:
 
-1. Import the repo into Vercel (framework auto-detected as Next.js, pnpm via the
-   committed `pnpm-lock.yaml`).
-2. Add the **Upstash Redis** (or Vercel KV) marketplace integration — it injects
-   the REST URL/token used by the signaling store.
-3. Deploy. The build runs `next build --webpack` (pinned for the inference
-   worker + ML package bundling).
+  ```bash
+  PORT=4444 npx y-webrtc-signaling   # or: node node_modules/y-webrtc/bin/server.js
+  # then set NEXT_PUBLIC_SIGNALING_URLS=wss://your-host:4444
+  ```
+
+  The relay only brokers the SDP/ICE handshake — no inference data flows
+  through it.
+- `NEXT_PUBLIC_TURN_URL` / `NEXT_PUBLIC_TURN_USERNAME` /
+  `NEXT_PUBLIC_TURN_CREDENTIAL` — optional TURN relay for restrictive NATs.
+
+## Deploy
+
+The build emits a static site to `out/` (`output: "export"`), so it can be
+hosted on any static host or CDN.
+
+1. Import the repo into Vercel (framework auto-detected as Next.js). It serves
+   the static export — no serverless functions are created.
+2. Deploy. `pnpm build` runs `next build --webpack` (pinned for the inference
+   worker + ML package bundling) and writes `out/`.
 
 ## Project layout
 

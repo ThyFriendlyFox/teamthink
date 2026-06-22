@@ -19,26 +19,25 @@ export const ICE_SERVERS: RTCIceServer[] = [
     : []),
 ];
 
-/** Signaling mailbox and room registry time-to-live (seconds). */
-export const ROOM_TTL_SECONDS = 60 * 60 * 6; // 6 hours
-export const SIGNAL_TTL_SECONDS = 60 * 2; // signaling messages are short-lived
-
 /** Presence heartbeat cadence and the staleness window for re-claiming work. */
 export const HEARTBEAT_INTERVAL_MS = 4000;
 export const PEER_STALE_MS = 15000;
 export const TASK_STALE_MS = 30000;
 
 /**
- * Signaling poll cadence. The loop polls fast while connections are being
- * established (or peers/messages are changing) and backs off toward the max
- * once the mesh is stable — at steady state all traffic is peer-to-peer, so the
- * server is only needed to notice newcomers. Kept under the presence window
- * (see PEER_PRESENCE_MS in the signaling store) so peers don't expire.
+ * Public WebRTC signaling relays used to broker the initial SDP/ICE handshake.
+ * These are free, third-party (or self-hosted) pub/sub servers — nothing of
+ * ours sits in the path. Peers in the same room topic find each other here,
+ * then talk directly peer-to-peer. Override with a comma-separated
+ * `NEXT_PUBLIC_SIGNALING_URLS` (e.g. to point at your own y-webrtc server).
  */
-export const SIGNAL_POLL_MIN_MS = 1500;
-export const SIGNAL_POLL_MAX_MS = 10000;
-/** Multiplicative backoff applied each idle poll. */
-export const SIGNAL_POLL_BACKOFF = 1.6;
+export const SIGNALING_SERVERS: string[] = (
+  process.env.NEXT_PUBLIC_SIGNALING_URLS ??
+  "wss://y-webrtc-eu.fly.dev,wss://signaling.yjs.dev"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 export type EngineKind = "webllm" | "transformers";
 
