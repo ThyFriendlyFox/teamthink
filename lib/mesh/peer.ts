@@ -1,26 +1,32 @@
-import { ICE_SERVERS, SIGNALING_SERVERS } from "@/lib/config";
-import { SignalingClient } from "@/lib/mesh/signaling";
+import { ICE_SERVERS } from "@/lib/config";
+import { KvSignaling } from "@/lib/mesh/kv-signaling";
+import { decodeInvite, encodeInvite, type InvitePayload } from "@/lib/mesh/invite";
 
 /**
- * Client-side WebRTC full-mesh manager built on a "tracker → seed" model.
+ * Client-side WebRTC full-mesh manager.
  *
- * The public pub/sub relay (see `signaling.ts`) is used only to find a *first*
- * peer: a joiner announces itself, an existing member replies, and the two
- * complete a single SDP/ICE handshake over the relay. That first peer is the
- * "seed". From then on the mesh is self-sustaining: peers gossip the membership
- * list to each other (PEX) over their data channels, and brokers relay the
- * WebRTC handshake for *new* pairs through the channels they already have. A
- * stable mesh sends nothing on the relay, and growing the mesh costs the relay
- * only one bootstrap handshake per joiner instead of one per pair.
+ * Rendezvous runs over our own KV-backed signaling endpoint (`/api/signal`) —
+ * no public WebRTC relays — and only ever brokers the *first* link for a new
+ * peer. The cost is bounded by design:
  *
- * The relay stays connected but idle so the node can keep seeding future
- * joiners, and remains a fallback if a mesh-brokered handshake fails. Nothing —
- * not signaling, not data — touches our own origin; the deployment only serves
- * the static page.
+ *   - Only one peer per room (the lowest-id "greeter") holds the room mailbox
+ *     open to greet newcomers. Everyone else stops talking to the server the
+ *     moment they have a mesh link.
+ *   - A newcomer connects to a single seed (the greeter, or — via an
+ *     offer-in-link invite — whoever minted the link). From there the mesh is
+ *     self-sustaining: peers gossip membership (PEX) over their data channels
+ *     and broker each *new* pair's handshake through a common neighbour, so
+ *     filling the mesh costs the server nothing.
+ *   - Handshakes are non-trickle: ICE is gathered up front and the whole
+ *     offer/answer travels as a single message, so a join is ~one or two tiny
+ *     KV writes, never a stream.
+ *
+ * A stable mesh sends zero signaling traffic. Inference/sync/tokens are always
+ * peer-to-peer and never touch the server.
  *
  * Framing: every data-channel frame is a Uint8Array whose first byte is a
- * channel tag, letting multiple logical streams (CRDT sync, app messages,
- * pipeline tensors, and internal mesh control) share one channel.
+ * channel tag, multiplexing CRDT sync, app messages, pipeline tensors, and
+ * internal mesh control over one channel.
  */
 
 export const CHANNEL_CRDT = 0;
@@ -30,8 +36,16 @@ export const CHANNEL_PIPE = 2;
 /** Internal: peer-exchange + brokered handshake. Not for application use. */
 const CHANNEL_MESH = 3;
 
+/** Mailbox name the elected greeter watches for newcomers. */
+const ROOM_BOX = "room";
+/** Re-announce schedule (ms after join) to ride out races / mailbox expiry. */
+const ANNOUNCE_BURST_MS = [0, 1500, 4000];
+/** Cap on waiting for ICE gathering before sending the SDP anyway. */
+const ICE_GATHER_TIMEOUT_MS = 3000;
+/** If a mesh-brokered handshake hasn't opened in this long, give up on it. */
+const BROKER_FALLBACK_MS = 9000;
+
 type FrameHandler = (peerId: string, payload: Uint8Array) => void;
-type WebrtcKind = "offer" | "answer" | "candidate";
 
 interface MeshEvents {
   onPeerOpen?: (peerId: string) => void;
@@ -41,53 +55,77 @@ interface MeshEvents {
 
 interface Connection {
   pc: RTCPeerConnection;
+  /** Mutable: an invite connection starts keyed by its invite key, then is
+   * re-keyed to the answerer's peer id once the answer arrives. */
+  peerId: string;
   channel?: RTCDataChannel;
-  pendingCandidates: RTCIceCandidateInit[];
-  remoteSet: boolean;
   open: boolean;
-  /** Set when this connection was started via a mesh broker (for fallback). */
+  /** True if this link was bootstrapped over KV (vs. brokered via the mesh). */
+  viaKv: boolean;
   brokerTimer?: ReturnType<typeof setTimeout>;
 }
-
-/** Re-announce schedule (ms after join/reconnect) to survive relay races. */
-const ANNOUNCE_BURST_MS = [0, 1500, 4000];
-/** If a mesh-brokered handshake hasn't opened in this long, retry over relay. */
-const BROKER_FALLBACK_MS = 9000;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+function randId(): string {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function waitForIce(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      pc.removeEventListener("icegatheringstatechange", check);
+      resolve();
+    };
+    const check = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+    setTimeout(finish, timeoutMs);
+  });
+}
+
 export class MeshClient {
   private connections = new Map<string, Connection>();
+  /** Outstanding offer-in-link invites, keyed by invite key (pre-answer). */
+  private pendingInvites = new Map<string, Connection>();
   private handlers = new Map<number, Set<FrameHandler>>();
-  private signaling: SignalingClient;
+  private kv: KvSignaling;
+  /** Boxes we currently hold open on the signaling endpoint. */
+  private subscribed = new Set<string>();
+  /** For a peer we can't reach directly, the neighbour that brokers to it. */
+  private brokerFor = new Map<string, string>();
   private announceTimers: ReturnType<typeof setTimeout>[] = [];
   private stopped = false;
-  /** For a peer we are not directly connected to, the neighbour that can relay
-   * our handshake to it. Also records the return path for inbound brokered
-   * signals. */
-  private brokerFor = new Map<string, string>();
-  /** True once we've started/seeded our first connection, so additional relay
-   * responders don't each trigger a separate bootstrap handshake. */
-  private seeded = false;
 
   constructor(
     readonly roomId: string,
     readonly peerId: string,
     private events: MeshEvents = {},
   ) {
-    this.signaling = new SignalingClient(
-      `teamthink/${roomId}`,
-      SIGNALING_SERVERS,
-      {
-        onMessage: (msg) => this.onSignal(msg),
-        onOpen: () => this.announceBurst(),
-      },
-    );
+    this.kv = new KvSignaling(roomId, {
+      onMessage: (box, msg) => this.onKv(box, msg),
+    });
   }
 
-  async start(): Promise<void> {
-    this.signaling.start();
+  /** `invite` is the decoded payload or raw `#i=...` blob if this tab opened an
+   * offer-in-link, in which case we connect to the inviter directly. */
+  async start(invite?: InvitePayload | string | null): Promise<void> {
+    const payload =
+      typeof invite === "string" ? decodeInvite(invite) : (invite ?? null);
+    if (payload) {
+      // Fast path: connect to the inviter directly, no announce / no greeter.
+      void this.acceptInvite(payload);
+    }
+    this.refreshKv();
+    this.announceBurst();
   }
 
   stop(): void {
@@ -95,18 +133,16 @@ export class MeshClient {
     for (const t of this.announceTimers) clearTimeout(t);
     this.announceTimers = [];
     // Best-effort departure notice so peers tear down promptly.
-    this.signaling.publish({ kind: "bye", from: this.peerId });
-    this.signaling.stop();
-    for (const [, conn] of this.connections) {
-      if (conn.brokerTimer) clearTimeout(conn.brokerTimer);
-      conn.channel?.close();
-      conn.pc.close();
-    }
+    this.broadcastMesh({ t: "bye", from: this.peerId });
+    this.kv.stop();
+    this.subscribed.clear();
+    for (const conn of this.connections.values()) this.closeConn(conn);
+    for (const conn of this.pendingInvites.values()) this.closeConn(conn);
     this.connections.clear();
+    this.pendingInvites.clear();
     this.brokerFor.clear();
   }
 
-  /** Subscribe to frames on a logical channel. Returns an unsubscribe fn. */
   on(channel: number, handler: FrameHandler): () => void {
     let set = this.handlers.get(channel);
     if (!set) {
@@ -132,112 +168,148 @@ export class MeshClient {
   }
 
   get connectedPeers(): string[] {
-    return [...this.connections.entries()]
-      .filter(([, c]) => c.open)
-      .map(([id]) => id);
+    return [...this.connections.values()]
+      .filter((c) => c.open)
+      .map((c) => c.peerId);
   }
 
-  // --- discovery / signaling ------------------------------------------------
+  /**
+   * Mint an offer-in-link invite. Creates a ready-to-go offer (ICE gathered)
+   * and returns the encoded blob to embed in a `#i=...` link. We hold the
+   * invite's one-time mailbox open only until the answer arrives.
+   */
+  async createInvite(): Promise<string> {
+    const key = randId();
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const conn: Connection = { pc, peerId: key, open: false, viaKv: true };
+    this.pendingInvites.set(key, conn);
+    this.setupPc(conn);
+    const channel = pc.createDataChannel("tt", { ordered: true });
+    this.bindChannel(conn, channel);
+    this.refreshKv();
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc, ICE_GATHER_TIMEOUT_MS);
+    return encodeInvite({
+      v: 1,
+      from: this.peerId,
+      key,
+      sdp: (pc.localDescription ?? offer).sdp ?? "",
+    });
+  }
 
-  /** Announce presence a few times to ride out relay/connect races. */
+  // --- signaling ------------------------------------------------------------
+
+  /** Reconcile which signaling boxes we hold open with what we actually need. */
+  private refreshKv(): void {
+    if (this.stopped) return;
+    const desired = new Set<string>();
+    const alone = this.connectedPeers.length === 0;
+    const greeter = this.isGreeter();
+    if (alone || greeter || this.hasPendingKv()) desired.add(this.peerId);
+    if (greeter) desired.add(ROOM_BOX);
+    for (const key of this.pendingInvites.keys()) desired.add(key);
+
+    for (const box of desired) {
+      if (!this.subscribed.has(box)) {
+        this.subscribed.add(box);
+        this.kv.listen(box);
+      }
+    }
+    for (const box of [...this.subscribed]) {
+      if (!desired.has(box)) {
+        this.subscribed.delete(box);
+        this.kv.unlisten(box);
+      }
+    }
+  }
+
+  /** Lowest-id peer (among us + our direct links) greets newcomers. */
+  private isGreeter(): boolean {
+    let min = this.peerId;
+    for (const id of this.connectedPeers) if (id < min) min = id;
+    return min === this.peerId;
+  }
+
+  private hasPendingKv(): boolean {
+    for (const c of this.connections.values()) if (c.viaKv && !c.open) return true;
+    return false;
+  }
+
   private announceBurst(): void {
     for (const t of this.announceTimers) clearTimeout(t);
     this.announceTimers = ANNOUNCE_BURST_MS.map((d) =>
       setTimeout(() => {
-        if (this.stopped) return;
-        // Stop re-announcing once we're part of a mesh; new joiners announce
-        // themselves and existing peers reply, so the relay stays idle.
-        if (this.connectedPeers.length > 0) return;
-        this.signaling.publish({ kind: "announce", from: this.peerId });
+        if (this.stopped || this.connectedPeers.length > 0) return;
+        void this.kv.publish(ROOM_BOX, { kind: "announce", from: this.peerId });
       }, d),
     );
   }
 
-  private onSignal(msg: Record<string, unknown>): void {
+  private onKv(box: string, msg: Record<string, unknown>): void {
     const from = msg.from as string | undefined;
-    if (!from || from === this.peerId) return; // ignore our own fan-out
     const kind = msg.kind as string | undefined;
 
-    if (kind === "announce") {
-      // Broadcast announce from a (re)joining peer: reply so they can pick us
-      // as a seed, but don't start a handshake — they drive the bootstrap.
-      this.signaling.publish({ kind: "here", from: this.peerId, to: from });
-    } else if (kind === "here" && msg.to === this.peerId) {
-      // A peer told us they exist. Use the first responder as our seed; the
-      // rest of the mesh is discovered peer-to-peer via PEX.
-      this.onSeedCandidate(from);
-    } else if (kind === "connect" && msg.to === this.peerId) {
-      // The seed handshake request: connect over the relay (bootstrap path).
-      this.maybeInitiate(from, undefined);
-    } else if (kind === "bye") {
-      this.teardown(from, true);
-    } else if (kind === "webrtc" && msg.to === this.peerId) {
-      const sig = msg.signal as { kind: WebrtcKind; data: unknown } | undefined;
-      if (sig) void this.handleSignal(from, sig.kind, sig.data, undefined);
+    if (box === ROOM_BOX) {
+      if (kind === "announce" && from) this.onAnnounce(from);
+      return;
+    }
+    // Otherwise box is our own inbox or an outstanding invite key.
+    if (kind !== "sdp" || !from) return;
+    const desc = msg.desc as RTCSessionDescriptionInit | undefined;
+    if (!desc) return;
+    if (this.pendingInvites.has(box)) {
+      void this.resolveInvite(box, from, desc);
+    } else {
+      void this.handleSdp(from, desc, undefined);
     }
   }
 
-  /** First relay responder becomes the seed; bootstrap a single connection. */
-  private onSeedCandidate(from: string): void {
-    if (this.connections.has(from)) return;
-    if (this.seeded || this.connectedPeers.length > 0) return;
-    this.seeded = true;
-    // Ask the seed to connect (covers the case where it has the lower id and
-    // must send the offer), and try to initiate ourselves if we're the lower.
-    this.signaling.publish({ kind: "connect", from: this.peerId, to: from });
-    this.maybeInitiate(from, undefined);
+  /** A newcomer announced on the room mailbox; greet them with an offer. */
+  private onAnnounce(from: string): void {
+    if (from === this.peerId || this.connections.has(from)) return;
+    const established = this.connectedPeers.length > 0;
+    // A settled mesh member always initiates to a newcomer; two unestablished
+    // peers fall back to a deterministic tie-break to avoid double-offering.
+    if (established || this.shouldInitiate(from)) void this.initiate(from, undefined);
   }
 
-  /** Deterministic tie-break so exactly one side creates the offer. */
   private shouldInitiate(peerId: string): boolean {
     return this.peerId < peerId;
   }
 
-  /** Start an offer toward `peerId` if we're the designated initiator and not
-   * already connecting. `broker` is the neighbour to relay through (undefined
-   * = use the public relay, i.e. the bootstrap/fallback path). */
-  private maybeInitiate(peerId: string, broker: string | undefined): void {
-    if (this.connections.has(peerId)) return;
-    if (this.shouldInitiate(peerId)) void this.initiate(peerId, broker);
-  }
-
-  /** Route a handshake signal to `to`: through a connected broker when we have
-   * one, otherwise over the public relay (bootstrap + fallback). */
-  private routeSignal(to: string, kind: WebrtcKind, data: unknown): void {
+  /** Route an SDP to `to`: through a connected broker when we have one, else
+   * over the KV mailbox (the seed/bootstrap path). */
+  private async routeSignal(
+    to: string,
+    desc: RTCSessionDescriptionInit,
+  ): Promise<void> {
     const broker = this.brokerFor.get(to);
     const brokerConn = broker ? this.connections.get(broker) : undefined;
     if (broker && broker !== to && brokerConn?.open) {
-      this.sendMesh(broker, {
-        t: "sig",
-        to,
-        from: this.peerId,
-        sig: { kind, data },
-      });
+      this.sendMesh(broker, { t: "sig", to, from: this.peerId, desc });
       return;
     }
-    this.signaling.publish({
-      kind: "webrtc",
-      from: this.peerId,
-      to,
-      signal: { kind, data },
-    });
+    await this.kv.publish(to, { kind: "sdp", from: this.peerId, desc });
   }
 
-  // --- peer exchange (PEX) + brokered handshake -----------------------------
+  // --- peer exchange (PEX) over the mesh ------------------------------------
 
   private sendMesh(peerId: string, obj: Record<string, unknown>): boolean {
     return this.sendTo(peerId, CHANNEL_MESH, enc.encode(JSON.stringify(obj)));
   }
 
-  /** Tell every neighbour the current membership so they can mesh with peers
-   * they don't yet know, brokered through us. */
+  private broadcastMesh(obj: Record<string, unknown>): void {
+    const frame = enc.encode(JSON.stringify(obj));
+    for (const [peerId] of this.connections) {
+      this.sendTo(peerId, CHANNEL_MESH, frame);
+    }
+  }
+
   private gossipPeers(): void {
     const peers = this.connectedPeers;
     for (const peerId of peers) {
-      this.sendMesh(peerId, {
-        t: "pex",
-        peers: peers.filter((p) => p !== peerId),
-      });
+      this.sendMesh(peerId, { t: "pex", peers: peers.filter((p) => p !== peerId) });
     }
   }
 
@@ -254,62 +326,52 @@ export class MeshClient {
       const peers = (msg.peers as string[] | undefined) ?? [];
       for (const p of peers) {
         if (p === this.peerId || this.connections.has(p)) continue;
-        // Connect to this newly-learned peer, brokered through the neighbour
-        // that told us about it (it is connected to both of us).
+        // Brokered through the neighbour that told us — it knows both of us.
         this.maybeInitiate(p, deliveredBy);
       }
     } else if (t === "sig") {
       const to = msg.to as string | undefined;
       const from = msg.from as string | undefined;
+      const desc = msg.desc as RTCSessionDescriptionInit | undefined;
       if (!to || !from) return;
       if (to === this.peerId) {
-        // The neighbour that delivered this is our return path to `from`.
-        if (!this.connections.get(from)?.open) this.brokerFor.set(from, deliveredBy);
-        const sig = msg.sig as { kind: WebrtcKind; data: unknown } | undefined;
-        if (sig) void this.handleSignal(from, sig.kind, sig.data, deliveredBy);
+        if (desc) void this.handleSdp(from, desc, deliveredBy);
       } else {
-        // One-hop forward toward the destination if we're connected to it.
-        this.sendMesh(to, msg);
+        this.sendMesh(to, msg); // one-hop forward
       }
+    } else if (t === "bye") {
+      const byeFrom = msg.from as string | undefined;
+      if (byeFrom) this.teardown(byeFrom, true);
     }
   }
 
   // --- connection setup -----------------------------------------------------
 
-  private createConnection(peerId: string): Connection {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const conn: Connection = {
-      pc,
-      pendingCandidates: [],
-      remoteSet: false,
-      open: false,
-    };
-    this.connections.set(peerId, conn);
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) this.routeSignal(peerId, "candidate", e.candidate.toJSON());
-    };
+  private setupPc(conn: Connection): void {
+    const pc = conn.pc;
     pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      if (state === "failed" || state === "closed") {
-        // Terminal: drop it so we can re-learn this peer (and re-seed if alone).
-        this.teardown(peerId, true);
-      } else if (state === "disconnected" && conn.open) {
-        // Possibly transient (ICE blip); keep the entry but mark it not open.
+      const s = pc.connectionState;
+      if (s === "failed" || s === "closed") {
+        this.teardown(conn.peerId, true);
+      } else if (s === "disconnected" && conn.open) {
         conn.open = false;
-        this.events.onPeerClose?.(peerId);
+        this.events.onPeerClose?.(conn.peerId);
         this.events.onPeersChange?.(this.connectedPeers);
+        this.refreshKv();
       }
     };
-    pc.ondatachannel = (e) => this.bindChannel(peerId, conn, e.channel);
+    pc.ondatachannel = (e) => this.bindChannel(conn, e.channel);
+  }
+
+  private createConnection(peerId: string, viaKv: boolean): Connection {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const conn: Connection = { pc, peerId, open: false, viaKv };
+    this.connections.set(peerId, conn);
+    this.setupPc(conn);
     return conn;
   }
 
-  private bindChannel(
-    peerId: string,
-    conn: Connection,
-    channel: RTCDataChannel,
-  ): void {
+  private bindChannel(conn: Connection, channel: RTCDataChannel): void {
     channel.binaryType = "arraybuffer";
     conn.channel = channel;
     channel.onopen = () => {
@@ -318,30 +380,36 @@ export class MeshClient {
         clearTimeout(conn.brokerTimer);
         conn.brokerTimer = undefined;
       }
-      // Once a direct link is up we no longer need a broker to reach this peer.
-      this.brokerFor.delete(peerId);
-      this.events.onPeerOpen?.(peerId);
+      this.brokerFor.delete(conn.peerId);
+      this.events.onPeerOpen?.(conn.peerId);
       this.events.onPeersChange?.(this.connectedPeers);
-      // Share membership so this peer and our other neighbours mesh up P2P.
       this.gossipPeers();
+      this.refreshKv();
     };
     channel.onclose = () => {
       if (conn.open) {
         conn.open = false;
-        this.events.onPeerClose?.(peerId);
+        this.events.onPeerClose?.(conn.peerId);
+        this.events.onPeersChange?.(this.connectedPeers);
+        this.refreshKv();
       }
     };
     channel.onmessage = (e) => {
       const buf = new Uint8Array(e.data as ArrayBuffer);
       const tag = buf[0];
-      const payload = buf.subarray(1);
+      const body = buf.subarray(1);
       if (tag === CHANNEL_MESH) {
-        this.onMeshControl(peerId, payload);
+        this.onMeshControl(conn.peerId, body);
         return;
       }
       const set = this.handlers.get(tag);
-      if (set) for (const h of set) h(peerId, payload);
+      if (set) for (const h of set) h(conn.peerId, body);
     };
+  }
+
+  private maybeInitiate(peerId: string, broker: string | undefined): void {
+    if (this.connections.has(peerId)) return;
+    if (this.shouldInitiate(peerId)) void this.initiate(peerId, broker);
   }
 
   private async initiate(
@@ -350,85 +418,124 @@ export class MeshClient {
   ): Promise<void> {
     if (this.connections.has(peerId)) return;
     if (broker) this.brokerFor.set(peerId, broker);
-    const conn = this.createConnection(peerId);
+    const conn = this.createConnection(peerId, broker === undefined);
     const channel = conn.pc.createDataChannel("tt", { ordered: true });
-    this.bindChannel(peerId, conn, channel);
-    // If we tried to broker through the mesh and it doesn't open in time, fall
-    // back to the public relay so connectivity never depends on a third hop.
+    this.bindChannel(conn, channel);
+    this.refreshKv(); // ensure our inbox is open to receive the answer
     if (broker) {
       conn.brokerTimer = setTimeout(() => {
         if (this.stopped || conn.open) return;
-        this.brokerFor.delete(peerId);
+        // Brokered handshake stalled; drop it so PEX can retry via another
+        // neighbour as the mesh changes.
         this.teardown(peerId);
-        this.signaling.publish({ kind: "connect", from: this.peerId, to: peerId });
-        this.maybeInitiate(peerId, undefined);
       }, BROKER_FALLBACK_MS);
     }
     const offer = await conn.pc.createOffer();
     await conn.pc.setLocalDescription(offer);
-    this.routeSignal(peerId, "offer", offer);
+    await waitForIce(conn.pc, ICE_GATHER_TIMEOUT_MS);
+    await this.routeSignal(peerId, conn.pc.localDescription ?? offer);
   }
 
-  private async handleSignal(
+  private async handleSdp(
     from: string,
-    kind: WebrtcKind,
-    data: unknown,
+    desc: RTCSessionDescriptionInit,
     broker: string | undefined,
   ): Promise<void> {
     let conn = this.connections.get(from);
 
-    if (kind === "offer") {
-      if (!conn) conn = this.createConnection(from);
+    if (desc.type === "offer") {
+      if (!conn) conn = this.createConnection(from, broker === undefined);
       if (broker) this.brokerFor.set(from, broker);
-      await conn.pc.setRemoteDescription(data as RTCSessionDescriptionInit);
-      conn.remoteSet = true;
-      await this.flushCandidates(conn);
+      await conn.pc.setRemoteDescription(desc);
       const answer = await conn.pc.createAnswer();
       await conn.pc.setLocalDescription(answer);
-      this.routeSignal(from, "answer", answer);
-    } else if (kind === "answer") {
+      await waitForIce(conn.pc, ICE_GATHER_TIMEOUT_MS);
+      await this.routeSignal(from, conn.pc.localDescription ?? answer);
+    } else if (desc.type === "answer") {
       if (!conn) return;
-      await conn.pc.setRemoteDescription(data as RTCSessionDescriptionInit);
-      conn.remoteSet = true;
-      await this.flushCandidates(conn);
-    } else if (kind === "candidate") {
-      if (!conn) return;
-      const cand = data as RTCIceCandidateInit;
-      if (conn.remoteSet) {
-        await conn.pc.addIceCandidate(cand).catch(() => {});
-      } else {
-        conn.pendingCandidates.push(cand);
-      }
+      await conn.pc.setRemoteDescription(desc);
     }
+    this.refreshKv();
   }
 
-  private async flushCandidates(conn: Connection): Promise<void> {
-    for (const cand of conn.pendingCandidates) {
-      await conn.pc.addIceCandidate(cand).catch(() => {});
-    }
-    conn.pendingCandidates = [];
+  // --- offer-in-link invites ------------------------------------------------
+
+  private async acceptInvite(p: InvitePayload): Promise<void> {
+    if (p.from === this.peerId || this.connections.has(p.from)) return;
+    const conn = this.createConnection(p.from, true);
+    await conn.pc.setRemoteDescription({ type: "offer", sdp: p.sdp });
+    const answer = await conn.pc.createAnswer();
+    await conn.pc.setLocalDescription(answer);
+    await waitForIce(conn.pc, ICE_GATHER_TIMEOUT_MS);
+    // Reply straight to the invite's one-time mailbox; the inviter is waiting.
+    await this.kv.publish(p.key, {
+      kind: "sdp",
+      from: this.peerId,
+      desc: conn.pc.localDescription ?? answer,
+    });
   }
 
-  private teardown(peerId: string, emitClose = false): void {
-    const conn = this.connections.get(peerId);
+  private async resolveInvite(
+    key: string,
+    from: string,
+    desc: RTCSessionDescriptionInit,
+  ): Promise<void> {
+    const conn = this.pendingInvites.get(key);
     if (!conn) return;
-    const wasOpen = conn.open;
-    if (conn.brokerTimer) clearTimeout(conn.brokerTimer);
-    conn.channel?.close();
-    conn.pc.close();
-    this.connections.delete(peerId);
-    this.brokerFor.delete(peerId);
-    if (emitClose && wasOpen) {
-      this.events.onPeerClose?.(peerId);
-      this.events.onPeersChange?.(this.connectedPeers);
+    this.pendingInvites.delete(key);
+    this.subscribed.delete(key);
+    this.kv.unlisten(key);
+    if (this.connections.has(from)) {
+      this.closeConn(conn); // already linked another way
+      this.refreshKv();
+      return;
     }
-    this.maybeReseed();
+    conn.peerId = from;
+    this.connections.set(from, conn);
+    await conn.pc.setRemoteDescription(desc);
+    this.refreshKv();
   }
 
-  /** If we've fallen out of the mesh entirely, look for a fresh seed. */
+  // --- teardown -------------------------------------------------------------
+
+  private closeConn(conn: Connection): void {
+    if (conn.brokerTimer) clearTimeout(conn.brokerTimer);
+    try {
+      conn.channel?.close();
+      conn.pc.close();
+    } catch {
+      // ignore
+    }
+  }
+
+  private teardown(id: string, emitClose = false): void {
+    const conn = this.connections.get(id);
+    if (conn) {
+      const wasOpen = conn.open;
+      this.closeConn(conn);
+      this.connections.delete(id);
+      this.brokerFor.delete(id);
+      if (emitClose && wasOpen) {
+        this.events.onPeerClose?.(conn.peerId);
+        this.events.onPeersChange?.(this.connectedPeers);
+      }
+      this.maybeReseed();
+      this.refreshKv();
+      return;
+    }
+    const pending = this.pendingInvites.get(id);
+    if (pending) {
+      this.closeConn(pending);
+      this.pendingInvites.delete(id);
+      this.subscribed.delete(id);
+      this.kv.unlisten(id);
+      this.refreshKv();
+    }
+  }
+
+  /** If we've fallen out of the mesh entirely, re-announce to find a seed. */
   private maybeReseed(): void {
     if (this.stopped || this.connections.size > 0) return;
-    this.seeded = false;
     this.announceBurst();
   }
 }

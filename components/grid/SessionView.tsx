@@ -16,7 +16,11 @@ export function SessionView({ roomId }: { roomId: string }) {
 
   return (
     <main className="flex-1">
-      <InviteBar roomId={roomId} connected={snapshot.connected} />
+      <InviteBar
+        roomId={roomId}
+        connected={snapshot.connected}
+        createInvite={() => node.createInvite()}
+      />
 
       <div className="mx-auto grid max-w-6xl gap-5 px-6 py-6 lg:grid-cols-[360px_1fr]">
         <div className="space-y-5">

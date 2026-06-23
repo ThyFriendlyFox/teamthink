@@ -146,7 +146,7 @@ export class GridNode {
     this.pipelines.observeDeep(() => this.onPipelinesChanged());
   }
 
-  async start(): Promise<void> {
+  async start(invite?: string | null): Promise<void> {
     if (this.started) return;
     this.started = true;
 
@@ -159,7 +159,7 @@ export class GridNode {
       this.onPipeFrame(peerId, payload),
     );
 
-    await this.mesh.start();
+    await this.mesh.start(invite);
 
     this.updateSelfPresence();
     this.heartbeatTimer = setInterval(
@@ -189,6 +189,11 @@ export class GridNode {
 
   getSnapshot(): GridSnapshot {
     return this.snapshot;
+  }
+
+  /** Mint an offer-in-link invite blob (embed after `#` in a session link). */
+  createInvite(): Promise<string> {
+    return this.mesh.createInvite();
   }
 
   /** Submit an inference request to the grid. Returns the task/job id. */

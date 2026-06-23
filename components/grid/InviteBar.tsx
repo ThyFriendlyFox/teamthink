@@ -8,22 +8,41 @@ import { Button } from "@/components/ui/Button";
 export function InviteBar({
   roomId,
   connected,
+  createInvite,
 }: {
   roomId: string;
   connected: boolean;
+  /** Mints an offer-in-link blob (the cheap, instant-connect invite). */
+  createInvite?: () => Promise<string>;
 }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"room" | "live" | null>(null);
+  const [minting, setMinting] = useState(false);
   const path = `/s?r=${roomId}`;
 
-  async function copy() {
-    const url =
-      typeof window !== "undefined" ? `${window.location.origin}${path}` : path;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+
+  async function copyRoom() {
     try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      await navigator.clipboard.writeText(`${origin}${path}`);
+      setCopied("room");
+      setTimeout(() => setCopied(null), 1500);
     } catch {
       // ignore clipboard failures
+    }
+  }
+
+  async function copyLive() {
+    if (!createInvite) return;
+    setMinting(true);
+    try {
+      const blob = await createInvite();
+      await navigator.clipboard.writeText(`${origin}${path}#${blob}`);
+      setCopied("live");
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      // ignore clipboard / mint failures
+    } finally {
+      setMinting(false);
     }
   }
 
@@ -46,9 +65,18 @@ export function InviteBar({
         <code className="hidden max-w-[280px] truncate rounded-lg border border-border bg-canvas px-3 py-1.5 text-xs text-ink-muted sm:block">
           {path}
         </code>
-        <Button size="sm" variant="secondary" onClick={copy}>
-          {copied ? "Copied" : "Copy invite"}
+        <Button size="sm" variant="secondary" onClick={copyRoom}>
+          {copied === "room" ? "Copied" : "Copy invite"}
         </Button>
+        {createInvite ? (
+          <Button size="sm" onClick={copyLive} disabled={minting}>
+            {copied === "live"
+              ? "Copied"
+              : minting
+                ? "Minting…"
+                : "Copy quick-join link"}
+          </Button>
+        ) : null}
       </div>
     </div>
   );

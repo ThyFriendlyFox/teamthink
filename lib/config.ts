@@ -25,19 +25,27 @@ export const PEER_STALE_MS = 15000;
 export const TASK_STALE_MS = 30000;
 
 /**
- * Public WebRTC signaling relays used to broker the initial SDP/ICE handshake.
- * These are free, third-party (or self-hosted) pub/sub servers — nothing of
- * ours sits in the path. Peers in the same room topic find each other here,
- * then talk directly peer-to-peer. Override with a comma-separated
- * `NEXT_PUBLIC_SIGNALING_URLS` (e.g. to point at your own y-webrtc server).
+ * Signaling transport tuning. The rendezvous is a KV-backed mailbox served by
+ * `/api/signal` on our own deployment (no public WebRTC relays). It is
+ * event-driven: a client holds one request open and the server returns as soon
+ * as a message is waiting (or after `SIGNAL_POLL_HOLD_MS`), so there is no busy
+ * polling. Mailboxes auto-expire so KV never accumulates state.
+ *
+ * Cost is bounded by the mesh design, not by the number of users: only one peer
+ * per room (the lowest-id "greeter") holds the room mailbox open to greet
+ * newcomers, and every other peer stops talking to the server entirely once it
+ * has a mesh link — further connections are brokered peer-to-peer.
  */
-export const SIGNALING_SERVERS: string[] = (
-  process.env.NEXT_PUBLIC_SIGNALING_URLS ??
-  "wss://y-webrtc-eu.fly.dev,wss://signaling.yjs.dev"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+export const SIGNAL_TTL_SECONDS = 120;
+/** Max time the server holds a long-poll open before returning empty (ms). */
+export const SIGNAL_POLL_HOLD_MS = 10000;
+/** How often the server checks the mailbox while holding a long-poll (ms). */
+export const SIGNAL_POLL_STEP_MS = 1000;
+/** Client backoff after a failed/empty signaling request (ms). */
+export const SIGNAL_RETRY_MS = 1500;
+/** Base path of the signaling endpoint (override for a separate host). */
+export const SIGNAL_ENDPOINT =
+  process.env.NEXT_PUBLIC_SIGNAL_ENDPOINT ?? "/api/signal";
 
 export type EngineKind = "webllm" | "transformers";
 
